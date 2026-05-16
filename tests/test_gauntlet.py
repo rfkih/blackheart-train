@@ -1,0 +1,339 @@
+"""Unit tests for the M5d 5-gate sub-model gauntlet.
+
+Pure-function tests over synthetic payloads. The gates are pure
+functions of an artifact payload, so we exercise each verdict path by
+crafting a minimal payload that triggers it. End-to-end coverage on
+real-data artifacts lives in the CLI run.
+"""
+from __future__ import annotations
+
+import math
+
+import pytest
+
+from blackheart_train.gauntlet import (
+    GauntletError,
+    _EDGE_THRESHOLD,
+    _RANDOM_BASELINE,
+    _STABILITY_THRESHOLD,
+    _gate_fold_stability,
+    _gate_generalization_edge,
+    _gate_integrity_passed,
+    _gate_saved_booster_above_random,
+    _gate_walk_forward_complete,
+    gauntlet_to_dict,
+    run_gauntlet,
+)
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────
+
+
+def _payload(
+    *,
+    integrity_verdict: str = "PASS",
+    primary_metric: str = "auc",
+    primary_mean: float = 0.60,
+    primary_std: float = 0.05,
+    metrics: dict | None = None,
+    n_folds: int = 6,
+    n_valid: int | None = None,
+) -> dict:
+    """Build a minimal payload that satisfies all gates. Tests override
+    fields to make individual gates fail."""
+    if metrics is None:
+        if primary_metric == "auc":
+            metrics = {"auc": 0.60, "log_loss": 0.65, "accuracy": 0.58}
+        else:
+            metrics = {"rmse": 0.04, "mae": 0.03, "pearson_r": 0.10}
+    if n_valid is None:
+        n_valid = n_folds
+    return {
+        "content_sha256": "deadbeef" * 8,
+        "data_fingerprint": "cafebabe" * 8,
+        # Tests default to a modulator spec; multiclass / directional
+        # tests override these explicitly.
+        "spec": {"name": "regime_btc_v1", "purpose": "regime", "objective": "binary"},
+        "integrity": {"verdict": integrity_verdict, "checks": []},
+        "metrics": metrics,
+        "eval_kind": "walk_forward_last_fold",
+        "walk_forward": {
+            "primary_metric": primary_metric,
+            "n_folds_configured": n_folds,
+            "n_folds_generated": n_folds,
+            "n_folds_run": n_folds,
+            "n_folds_valid_metric": n_valid,
+            "primary_mean": primary_mean,
+            "primary_median": primary_mean,
+            "primary_std": primary_std,
+            "metric_means": {primary_metric: primary_mean},
+            "folds": [],
+        },
+    }
+
+
+# ── Gate 1: integrity_passed ──────────────────────────────────────────────
+
+
+def test_gate_integrity_passes_on_pass_verdict():
+    g = _gate_integrity_passed(_payload(integrity_verdict="PASS"))
+    assert g.verdict == "PASS"
+
+
+def test_gate_integrity_passes_on_warn_verdict():
+    """WARN means integrity surfaced concerns but didn't block training.
+    Gate must not penalise; the WARN is recorded elsewhere."""
+    g = _gate_integrity_passed(_payload(integrity_verdict="WARN"))
+    assert g.verdict == "PASS"
+
+
+def test_gate_integrity_fails_on_fail_verdict():
+    g = _gate_integrity_passed(_payload(integrity_verdict="FAIL"))
+    assert g.verdict == "FAIL"
+
+
+def test_gate_integrity_fails_on_missing_block():
+    p = _payload()
+    del p["integrity"]
+    g = _gate_integrity_passed(p)
+    assert g.verdict == "FAIL"
+
+
+# ── Gate 2: walk_forward_complete ─────────────────────────────────────────
+
+
+def test_gate_wf_complete_passes_when_all_folds_valid():
+    g = _gate_walk_forward_complete(_payload(n_folds=6, n_valid=6))
+    assert g.verdict == "PASS"
+
+
+def test_gate_wf_complete_fails_when_a_fold_skipped():
+    g = _gate_walk_forward_complete(_payload(n_folds=6, n_valid=5))
+    assert g.verdict == "FAIL"
+    assert g.actual["n_folds_valid_metric"] == 5
+
+
+def test_gate_wf_complete_fails_when_no_walk_forward_block():
+    p = _payload()
+    p["walk_forward"] = None
+    g = _gate_walk_forward_complete(p)
+    assert g.verdict == "FAIL"
+
+
+# ── Gate 3: generalization_edge ───────────────────────────────────────────
+
+
+def test_gate_edge_passes_above_threshold_binary():
+    th = _EDGE_THRESHOLD["auc"]
+    g = _gate_generalization_edge(_payload(primary_metric="auc", primary_mean=th + 0.01))
+    assert g.verdict == "PASS"
+
+
+def test_gate_edge_passes_exactly_at_threshold_binary():
+    """≥, not >."""
+    th = _EDGE_THRESHOLD["auc"]
+    g = _gate_generalization_edge(_payload(primary_metric="auc", primary_mean=th))
+    assert g.verdict == "PASS"
+
+
+def test_gate_edge_fails_below_threshold_binary():
+    th = _EDGE_THRESHOLD["auc"]
+    g = _gate_generalization_edge(_payload(primary_metric="auc", primary_mean=th - 0.01))
+    assert g.verdict == "FAIL"
+
+
+def test_gate_edge_passes_above_threshold_regression():
+    th = _EDGE_THRESHOLD["pearson_r"]
+    p = _payload(primary_metric="pearson_r", primary_mean=th + 0.01,
+                 metrics={"rmse": 1.0, "mae": 0.8, "pearson_r": 0.10})
+    g = _gate_generalization_edge(p)
+    assert g.verdict == "PASS"
+
+
+def test_gate_edge_fails_when_mean_is_nan():
+    g = _gate_generalization_edge(_payload(primary_mean=float("nan")))
+    assert g.verdict == "FAIL"
+
+
+def test_gate_edge_skips_on_unknown_metric():
+    p = _payload()
+    p["walk_forward"]["primary_metric"] = "spearman_r"   # not in threshold table
+    g = _gate_generalization_edge(p)
+    assert g.verdict == "SKIP"
+
+
+# ── Gate 4: fold_stability ────────────────────────────────────────────────
+
+
+def test_gate_stability_passes_below_threshold_binary():
+    th = _STABILITY_THRESHOLD["auc"]
+    g = _gate_fold_stability(_payload(primary_std=th - 0.01))
+    assert g.verdict == "PASS"
+
+
+def test_gate_stability_fails_above_threshold_binary():
+    th = _STABILITY_THRESHOLD["auc"]
+    g = _gate_fold_stability(_payload(primary_std=th + 0.01))
+    assert g.verdict == "FAIL"
+
+
+def test_gate_stability_fails_on_nan_std():
+    g = _gate_fold_stability(_payload(primary_std=float("nan")))
+    assert g.verdict == "FAIL"
+
+
+# ── Gate 5: saved_booster_above_random ────────────────────────────────────
+
+
+def test_gate_above_random_passes_for_binary():
+    p = _payload(primary_metric="auc", metrics={"auc": 0.55, "log_loss": 0.7, "accuracy": 0.55})
+    g = _gate_saved_booster_above_random(p)
+    assert g.verdict == "PASS"
+
+
+def test_gate_above_random_fails_for_binary_below_05():
+    p = _payload(primary_metric="auc", metrics={"auc": 0.48, "log_loss": 0.7, "accuracy": 0.48})
+    g = _gate_saved_booster_above_random(p)
+    assert g.verdict == "FAIL"
+
+
+def test_gate_above_random_passes_for_regression():
+    p = _payload(primary_metric="pearson_r",
+                 metrics={"rmse": 0.04, "mae": 0.03, "pearson_r": 0.01})
+    g = _gate_saved_booster_above_random(p)
+    assert g.verdict == "PASS"
+
+
+def test_gate_above_random_fails_for_regression_below_0():
+    p = _payload(primary_metric="pearson_r",
+                 metrics={"rmse": 0.04, "mae": 0.03, "pearson_r": -0.01})
+    g = _gate_saved_booster_above_random(p)
+    assert g.verdict == "FAIL"
+
+
+def test_gate_above_random_fails_on_nan_value():
+    p = _payload(primary_metric="auc",
+                 metrics={"auc": float("nan"), "log_loss": 1.0, "accuracy": 0.5})
+    g = _gate_saved_booster_above_random(p)
+    assert g.verdict == "FAIL"
+
+
+# ── Aggregation: run_gauntlet ─────────────────────────────────────────────
+
+
+def test_run_gauntlet_overall_pass_on_clean_payload():
+    p = _payload(integrity_verdict="PASS", primary_mean=0.60, primary_std=0.05,
+                 metrics={"auc": 0.60, "log_loss": 0.7, "accuracy": 0.55})
+    report = run_gauntlet(p)
+    assert report.overall_verdict == "PASS"
+    assert len(report.gates) == 5
+    assert all(g.verdict == "PASS" for g in report.gates)
+
+
+def test_run_gauntlet_overall_fail_when_one_gate_fails():
+    p = _payload(primary_std=0.50)   # blow up stability
+    report = run_gauntlet(p)
+    assert report.overall_verdict == "FAIL"
+    fail_gates = [g.name for g in report.gates if g.verdict == "FAIL"]
+    assert "fold_stability" in fail_gates
+
+
+def test_run_gauntlet_raises_when_walk_forward_missing():
+    p = _payload()
+    p["walk_forward"] = None
+    with pytest.raises(GauntletError, match="walk_forward"):
+        run_gauntlet(p)
+
+
+def test_run_gauntlet_refuses_multiclass_objective():
+    """MG5 fix: the 5-gate gauntlet is calibrated for HYBRID modulator
+    sub-models (binary/regression). A multiclass directional payload
+    must be refused up front with a clear pointer to the full 13-gate
+    gauntlet — not silently FAIL with three SKIP gates whose rationale
+    is the cryptic 'no edge threshold for metric macro_auc_ovr'."""
+    p = _payload()
+    p["spec"] = {
+        "name": "directional_btc_1h_v1",
+        "purpose": "directional",
+        "objective": "multiclass",
+    }
+    with pytest.raises(GauntletError, match="13-gate gauntlet"):
+        run_gauntlet(p)
+
+
+def test_run_gauntlet_refuses_directional_purpose_even_if_binary():
+    """Defence in depth — a hypothetical directional model with a
+    binary objective is still wrong-gauntlet."""
+    p = _payload()
+    p["spec"] = {
+        "name": "directional_x",
+        "purpose": "directional",
+        "objective": "binary",
+    }
+    with pytest.raises(GauntletError, match="13-gate gauntlet"):
+        run_gauntlet(p)
+
+
+def test_run_gauntlet_propagates_traceability_fields():
+    p = _payload()
+    report = run_gauntlet(p)
+    assert report.artifact_content_sha == p["content_sha256"]
+    assert report.data_fingerprint == p["data_fingerprint"]
+    assert report.primary_metric == "auc"
+
+
+# ── Serialisation ─────────────────────────────────────────────────────────
+
+
+def test_gauntlet_to_dict_has_expected_keys():
+    p = _payload()
+    report = run_gauntlet(p)
+    d = gauntlet_to_dict(report)
+    for key in ("spec_name", "overall_verdict", "primary_metric",
+                "artifact_content_sha", "data_fingerprint", "gates"):
+        assert key in d, f"missing key: {key}"
+    assert len(d["gates"]) == 5
+    for gate_dict in d["gates"]:
+        for key in ("name", "verdict", "threshold", "actual", "rationale"):
+            assert key in gate_dict
+
+
+# ── Realistic regression scenarios ────────────────────────────────────────
+
+
+def test_real_world_m5c_regime_data_fails_gauntlet():
+    """The M5c real-data run reported regime_btc_v1 with primary_mean=0.4566,
+    primary_std=0.0942, and saved-booster AUC=0.5371. That should fail
+    generalization_edge (mean < 0.52) but PASS the other 4 gates."""
+    p = _payload(
+        primary_metric="auc",
+        primary_mean=0.4566,
+        primary_std=0.0942,
+        metrics={"auc": 0.5371, "log_loss": 1.20, "accuracy": 0.47},
+    )
+    report = run_gauntlet(p)
+    assert report.overall_verdict == "FAIL"
+    by_name = {g.name: g.verdict for g in report.gates}
+    assert by_name["generalization_edge"] == "FAIL"
+    assert by_name["fold_stability"] == "PASS"   # 0.094 < 0.15
+    assert by_name["saved_booster_above_random"] == "PASS"   # 0.5371 > 0.5
+    assert by_name["integrity_passed"] == "PASS"
+    assert by_name["walk_forward_complete"] == "PASS"
+
+
+def test_real_world_m5c_flow_data_fails_gauntlet():
+    """flow_btc_v1: mean=-0.010, std=0.322, saved=last fold pearson=-0.221.
+    Should fail edge (mean < 0.05), stability (std > 0.20), and
+    saved_booster (-0.221 < 0)."""
+    p = _payload(
+        primary_metric="pearson_r",
+        primary_mean=-0.010,
+        primary_std=0.322,
+        metrics={"rmse": 0.057, "mae": 0.048, "pearson_r": -0.221},
+    )
+    report = run_gauntlet(p)
+    assert report.overall_verdict == "FAIL"
+    by_name = {g.name: g.verdict for g in report.gates}
+    assert by_name["generalization_edge"] == "FAIL"
+    assert by_name["fold_stability"] == "FAIL"
+    assert by_name["saved_booster_above_random"] == "FAIL"

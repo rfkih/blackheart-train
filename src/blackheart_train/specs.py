@@ -1,0 +1,459 @@
+"""Locked sub-model specs per blueprint § 6.1.
+
+Three HYBRID modulator sub-models on BTC 1h bars, training window
+2024-12-01 → 2026-05-14. Input feature set is derived from the registry
+*excluding* the four labels and the four source-capped features deferred
+to v2 (see project_ml_blueprint.md, Tier C in the M5 kickoff audit).
+
+A ModelSpec is a pure data record. The training pipeline consumes it,
+the artifact metadata serialises it, and M5e's registry write will
+materialise it into a model_registry row.
+
+Immutability:
+
+* The dataclass is frozen — direct field replacement is blocked.
+* ``hyperparams`` is a plain dict. The training pipeline copies it via
+  ``dict(spec.hyperparams)`` before forwarding to LightGBM, so the
+  shared default factory's output is not mutated by the model layer.
+  Don't mutate ``spec.hyperparams`` in place — there is no enforcement
+  (a MappingProxyType view was tried but breaks ``dataclasses.asdict``
+  on Python 3.14, which can't deepcopy mappingproxy). If you want to
+  experiment with hyperparams, build a new ``ModelSpec`` via ``replace``.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Literal
+
+Objective = Literal["binary", "regression", "multiclass"]
+# multiclass: 3-class directional model (label_triple_barrier; classes
+# -1/0/+1 mapped to 0/1/2 inside train.py before LightGBM sees them).
+# Used by the Phase 3 directional model (blueprint § 6.2), not by the
+# Phase 2 modulator sub-models.
+
+
+# Features in feature_registry that are NOT inputs to the sub-models.
+#
+# Originally this set held BOTH labels (the four ``label_*`` rows) AND
+# the four Tier-C features whose source-side history is capped <30 days
+# (Binance public futures-data endpoints + CoinGecko free-tier
+# dominance). H9 audit (2026-05-16): labels are now filtered exclusively
+# by ``loader._list_input_features``'s schema-based predicate
+# ``(label_direction IS NULL OR label_direction <> 'forward')`` — the
+# seed migrations V73/V74/V77 set ``label_direction='forward'`` on every
+# label row. Keeping labels in this set as well meant TWO lists had to
+# stay in sync; the morning of 2026-05-16 a label leaked into a train
+# matrix because V77 added a label but the EXCLUDED set wasn't updated
+# (regime_btc_v3 trivial AUC=1.0 leak — see Session 1+2 memo).
+#
+# Now: this set covers only the Tier-C source-capped features (NOT
+# labels) — those cannot be filtered by ``label_direction`` because
+# they aren't labels. Adding a NEW non-label feature that should be
+# excluded still requires editing this set.
+#
+# A future label added without ``label_direction='forward'`` would
+# bypass the schema filter. Operators adding label features in a
+# future migration must set ``label_direction='forward'`` in the
+# INSERT. ``test_excluded_from_inputs_has_no_labels`` pins the
+# invariant on the Python side; a DB-level CHECK constraint on
+# ``feature_name LIKE 'label_%' => label_direction IS NOT NULL`` would
+# be the next hardening step.
+EXCLUDED_FROM_INPUTS: frozenset[str] = frozenset({
+    "btc_oi_change_24h_pct",
+    "taker_buy_ratio_4h",
+    "topls_ratio_change_24h",
+    "btc_dominance_change_7d",
+})
+
+
+# Intervals usable in stacked-interval training. Must stay in sync with
+# ``loader._INTERVAL_INDICATOR_ENCODING`` and ``loader._INTERVAL_HOURS``.
+# A spec asking for an interval outside this set fails at construction
+# rather than at load time.
+_STACKABLE_INTERVALS: frozenset[str] = frozenset({"5m", "15m", "1h", "4h"})
+
+
+# Default hyperparams shared across the three M5a specs. The factory
+# returns a fresh dict per ``ModelSpec`` instance so two specs do not
+# alias each other.
+def _default_hyperparams() -> dict[str, object]:
+    return {
+        "num_leaves": 31,
+        "max_depth": -1,
+        "learning_rate": 0.05,
+        "n_estimators": 500,
+        "min_child_samples": 50,
+        "reg_alpha": 0.0,
+        "reg_lambda": 0.0,
+        "subsample": 0.8,
+        "subsample_freq": 1,
+        "colsample_bytree": 0.8,
+        "random_state": 42,
+        "verbosity": -1,
+    }
+
+
+@dataclass(frozen=True)
+class ModelSpec:
+    """A trainable sub-model. Frozen + read-only hyperparams so the spec
+    hashes deterministically into artifact metadata.
+    """
+
+    name: str
+    purpose: Literal["regime", "positioning", "flow", "directional"]
+    label_feature: str
+    label_version: int
+    objective: Objective
+    symbol: str
+    interval: str
+
+    # Training window. Inclusive of start, exclusive of end (standard half-open).
+    train_start: datetime
+    train_end: datetime
+
+    # Fraction of the (chronologically-ordered) window held out for
+    # validation. Walk-forward replaces this in M5c.
+    val_fraction: float = 0.2
+
+    # Convention: do not mutate in place. See module docstring.
+    hyperparams: dict[str, object] = field(default_factory=_default_hyperparams)
+
+    # M5d-followup: derived features computed in-train from market_data.
+    # An empty tuple means "registry features only" (v1 behaviour).
+    # Names must exist in ``derived_features.DERIVED_FEATURES``. The
+    # loader fetches the necessary market_data symbols and computes the
+    # series at runtime — they never land in feature_values until
+    # promoted into the registry. Labels are still resolved by
+    # ``label_feature``: the loader checks ``DERIVED_LABELS`` first,
+    # falling back to the registry's ``feature_values`` table.
+    derived_features: tuple[str, ...] = ()
+
+    # M5g.3: base models for the ensemble. Single-element ``("lightgbm",)``
+    # is the Phase 2 modulator default and produces a single-model
+    # training path identical to M5a/b/c behaviour. Multi-element values
+    # — e.g. ``("lightgbm", "xgboost", "logreg_l1")`` — route training
+    # through the ensemble path in :mod:`blackheart_train.ensemble`,
+    # adding per-base + ensemble + disagreement metrics to the artifact.
+    # Only meaningful for ``objective == "multiclass"`` today (binary
+    # and regression paths ignore this field).
+    #
+    # Invariant (EB2/EB3 fixes): "lightgbm" MUST be the first element.
+    # Originally this guarded the M5g.3 phase 1 booster-extraction path
+    # which only persisted LightGBM. Post-Phase-2 the full ensemble is
+    # persisted, but the constraint stays: ``BASE_MODEL_ORDER`` puts
+    # LightGBM first so per-class proba averaging is deterministic;
+    # ``lgb_*`` is treated as the primary metric prefix; the M5d gauntlet
+    # gate names assume a LightGBM primary. Allowing a non-LightGBM-led
+    # tuple would silently shift those semantics with no spec-visible
+    # warning. Cheaper to refuse the spec.
+    base_models: tuple[str, ...] = ("lightgbm",)
+
+    # M5g.4: meta-label gating. When True (and ``len(base_models) > 1``),
+    # the training loop fits a Logistic-L1 meta-label on out-of-sample
+    # primary predictions and adds ``gated_*`` metrics to the artifact
+    # (gated_selectivity / gated_accuracy / gated_accuracy_uplift /
+    # ungated_accuracy). The meta-label itself isn't yet persisted —
+    # M5g.4 phase 2 wires that in along with the inference plumbing.
+    # Ignored for single-base-model specs.
+    meta_label_enabled: bool = False
+
+    # M5g.5: stacked-interval training (blueprint § 6.3 Fix 1a).
+    # Empty tuple or ``(interval,)`` → single-interval training (default,
+    # identical to M5g.1-4 behaviour). Multi-element — e.g.
+    # ``("1h", "15m")`` — routes through ``loader.load_stacked_dataset``
+    # which concats per-interval datasets with an ``interval_indicator``
+    # categorical column. The serving interval (``spec.interval``) MUST
+    # appear in the tuple; auxiliary intervals get the registry's 1h
+    # features forward-filled onto their bar grid, plus the derived
+    # features and triple-barrier label recomputed at the new cadence.
+    #
+    # Used only by the directional spec today — the modulator sub-models
+    # have plenty of 1h data and don't need the 4× sample-size uplift
+    # that stacking 15m gives.
+    training_intervals: tuple[str, ...] = ()
+
+    # M5g.7: per-fold feature selection (blueprint § 7.5 Fix 5).
+    # When True, ``walk_forward.run_walk_forward`` runs correlation
+    # pruning + MI top-K on each fold's X_tr BEFORE fit_and_evaluate,
+    # capping at ``feature_selection.MAX_FEATURES_DEFAULT`` (=8).
+    # Per-fold selected column lists land in ``FoldMetrics.features_selected``
+    # so a reviewer can audit "which features survived in ≥5 of 6 folds?"
+    # (consistent signal) vs single-fold survivors (noise).
+    # Off by default to preserve M5g.1-6 behaviour. Only the directional
+    # spec opts in today; modulators have fewer collinearity concerns at
+    # their feature counts.
+    feature_selection_enabled: bool = False
+
+    # ES1: LightGBM early stopping for single-model paths.
+    # When > 0, ``fit_and_evaluate`` carves the chronological tail of
+    # X_tr (size = early_stopping_val_fraction) as an inner validation
+    # slice, applies a label-horizon embargo gap between the inner-train
+    # tail and the inner-val head, and fits with
+    # ``callbacks=[lgb.early_stopping(rounds, verbose=False)]``. Stops
+    # when no improvement in ``rounds`` consecutive boosting rounds; the
+    # spec's ``hyperparams['n_estimators']`` becomes a hard cap, not a
+    # fixed iteration count.
+    #
+    # Off by default (= 0) so existing locked specs (regime_btc_v3,
+    # flow_btc_v2, etc.) hash to a different content_sha only if they
+    # explicitly opt in. The inner-val slice is held out from the fit
+    # so it does NOT leak into the booster — but it DOES leak its row
+    # count into hyperparameter choice (early stop point). That is the
+    # standard early-stopping tradeoff; the OOF fold's test slice is
+    # still genuinely out-of-sample.
+    #
+    # Skipped silently for ensemble specs (len(base_models) > 1). M5g.3
+    # ensemble's three base models would each need their own ES wiring;
+    # deferred to a separate change.
+    early_stopping_rounds: int = 0
+    # Chronological tail fraction of X_tr used as the early-stopping
+    # inner validation slice. Default 0.15 keeps 85% of the fold's
+    # training data for fitting. Only consulted when
+    # early_stopping_rounds > 0.
+    early_stopping_val_fraction: float = 0.15
+
+    def __post_init__(self) -> None:
+        if not self.base_models:
+            raise ValueError(
+                f"spec={self.name}: base_models cannot be empty"
+            )
+        if self.base_models[0] != "lightgbm":
+            raise ValueError(
+                f"spec={self.name}: base_models must start with 'lightgbm' "
+                f"(got {self.base_models!r}). LightGBM is the primary base "
+                f"model — per-class proba averaging, the lgb_* metric "
+                f"prefix, and the M5d gauntlet's primary-metric semantics "
+                f"all assume LightGBM is first. Reorder or remove the "
+                f"non-LightGBM kinds if you need a non-LightGBM primary."
+            )
+        # M5g.5: if training_intervals is set, serving interval must
+        # appear in it. Otherwise the model would be trained on auxiliary
+        # data only and serve on a cadence it never saw — meaningless.
+        if self.training_intervals and self.interval not in self.training_intervals:
+            raise ValueError(
+                f"spec={self.name}: serving interval {self.interval!r} must "
+                f"appear in training_intervals {self.training_intervals!r}. "
+                f"Stacked-interval training expands the training set; the "
+                f"model still serves on spec.interval."
+            )
+        # MS3: training_intervals must not contain duplicates — the
+        # loader assumes a unique mapping per interval. Two identical
+        # entries would double-count rows and corrupt the
+        # interval_indicator semantics.
+        if self.training_intervals and len(set(self.training_intervals)) != len(self.training_intervals):
+            raise ValueError(
+                f"spec={self.name}: training_intervals contains duplicates "
+                f"({self.training_intervals!r}); each interval must appear once."
+            )
+        # MS3: every interval must be loader-stackable. Catches typos
+        # ('1H' vs '1h') and intervals we haven't added support for yet
+        # at construction time rather than at load time.
+        unknown = set(self.training_intervals) - _STACKABLE_INTERVALS
+        if unknown:
+            raise ValueError(
+                f"spec={self.name}: training_intervals contains "
+                f"unstackable values {sorted(unknown)!r}; loader supports "
+                f"{sorted(_STACKABLE_INTERVALS)!r}"
+            )
+        # ES1: early-stopping field validation. Sentinel 0 disables;
+        # negative rounds and out-of-range fractions are user errors.
+        if self.early_stopping_rounds < 0:
+            raise ValueError(
+                f"spec={self.name}: early_stopping_rounds must be >= 0 "
+                f"(got {self.early_stopping_rounds!r}); 0 disables, "
+                f"positive enables LightGBM early stopping"
+            )
+        if not (0.0 < self.early_stopping_val_fraction < 1.0):
+            raise ValueError(
+                f"spec={self.name}: early_stopping_val_fraction must be in "
+                f"(0, 1) (got {self.early_stopping_val_fraction!r})"
+            )
+
+
+# Locked training window for M5 (blueprint § 19): the 17-month gate window
+# we just finished backfilling. Walk-forward folds in M5c subdivide this.
+_TRAIN_START = datetime(2024, 12, 1)
+_TRAIN_END = datetime(2026, 5, 14)
+
+
+SPECS: dict[str, ModelSpec] = {
+    "regime_btc_v1": ModelSpec(
+        name="regime_btc_v1",
+        purpose="regime",
+        label_feature="label_regime_risk_on_48h",
+        label_version=1,
+        objective="binary",
+        symbol="BTCUSDT",
+        interval="1h",
+        train_start=_TRAIN_START,
+        train_end=_TRAIN_END,
+    ),
+    "positioning_btc_v1": ModelSpec(
+        name="positioning_btc_v1",
+        purpose="positioning",
+        label_feature="label_meanrev_24h",
+        label_version=1,
+        objective="regression",
+        symbol="BTCUSDT",
+        interval="1h",
+        train_start=_TRAIN_START,
+        train_end=_TRAIN_END,
+    ),
+    "flow_btc_v1": ModelSpec(
+        name="flow_btc_v1",
+        purpose="flow",
+        label_feature="label_return_7d",
+        label_version=1,
+        objective="regression",
+        symbol="BTCUSDT",
+        interval="1h",
+        train_start=_TRAIN_START,
+        train_end=_TRAIN_END,
+    ),
+    # M5d-followup v2 variants: registry features + 4 derived features,
+    # and shorter forward horizons on the labels. Each v2 spec isolates
+    # one or two changes vs its v1 sibling so the gauntlet's verdict
+    # tells us which lever moved the needle (or whether none did).
+    "regime_btc_v2": ModelSpec(
+        name="regime_btc_v2",
+        purpose="regime",
+        # 24h forward Sharpe sign instead of 48h — shorter horizon is
+        # less smeared by intraday noise integration over 2 days.
+        label_feature="label_regime_risk_on_24h",
+        label_version=1,
+        objective="binary",
+        symbol="BTCUSDT",
+        interval="1h",
+        train_start=_TRAIN_START,
+        train_end=_TRAIN_END,
+        derived_features=(
+            "btc_log_return_24h",
+            "btc_realized_vol_7d",
+            "btc_volume_zscore_24h",
+            "eth_btc_corr_24h",
+        ),
+    ),
+    # Phase 4 / Session 2 — registry-only twin of regime_btc_v2. Same
+    # label, same input set, but derived_features=() and the label is
+    # resolved via feature_registry (V77 seeded the rows; train-side
+    # DERIVED_LABELS no longer carries label_regime_risk_on_24h). This
+    # flips deployment_readiness.deployment_ready=True so the artifact
+    # lands as status=trained instead of awaiting_operator_review.
+    #
+    # Bit-equivalence to v2 was verified pre-registration: the V77 seed
+    # transformer for label_regime_risk_on_24h is the train-compat twin
+    # (_forward_sharpe_binary_sign_train_compat) which exactly mirrors
+    # blackheart_train.derived_features._t_label_regime_risk_on_24h. The
+    # four input features are also bit-equivalent (verified by
+    # blackheart-ingest/tests/test_train_ingest_equivalence.py). So v3's
+    # walk-forward AUC should match v2 within rounding.
+    "regime_btc_v3": ModelSpec(
+        name="regime_btc_v3",
+        purpose="regime",
+        label_feature="label_regime_risk_on_24h",
+        label_version=1,
+        objective="binary",
+        symbol="BTCUSDT",
+        interval="1h",
+        train_start=_TRAIN_START,
+        train_end=_TRAIN_END,
+        # Empty: all inputs now come from feature_registry via V77.
+        derived_features=(),
+    ),
+    "positioning_btc_v2": ModelSpec(
+        name="positioning_btc_v2",
+        purpose="positioning",
+        # Same label as v1 (label_meanrev_24h is already 24h forward) —
+        # the only variable changing here is the feature set.
+        label_feature="label_meanrev_24h",
+        label_version=1,
+        objective="regression",
+        symbol="BTCUSDT",
+        interval="1h",
+        train_start=_TRAIN_START,
+        train_end=_TRAIN_END,
+        derived_features=(
+            "btc_log_return_24h",
+            "btc_realized_vol_7d",
+            "btc_volume_zscore_24h",
+            "eth_btc_corr_24h",
+        ),
+    ),
+    "flow_btc_v2": ModelSpec(
+        name="flow_btc_v2",
+        purpose="flow",
+        # 24h forward return instead of 168h — 7-day flow is too
+        # macro-driven for hourly bars; 24h pulls signal into a window
+        # the features can plausibly explain.
+        label_feature="label_return_24h",
+        label_version=1,
+        objective="regression",
+        symbol="BTCUSDT",
+        interval="1h",
+        train_start=_TRAIN_START,
+        train_end=_TRAIN_END,
+        derived_features=(
+            "btc_log_return_24h",
+            "btc_realized_vol_7d",
+            "btc_volume_zscore_24h",
+            "eth_btc_corr_24h",
+        ),
+    ),
+    # Phase 3 / M5g foundation — directional model (blueprint § 6.2).
+    # Targets triple-barrier outcomes (TP-hit / SL-hit / horizon-end).
+    # Used standalone by the ML_DIRECTIONAL strategy if it clears the
+    # full 13-gate gauntlet. M5g.1 shipped the multiclass training path;
+    # M5g.2 added walk-forward support; M5g.3 enables the 3-model
+    # ensemble via ``base_models`` (LightGBM + XGBoost + Logistic-L1
+    # per blueprint § 6.2). Meta-label gating is M5g.4. Hyperparams
+    # override ``n_estimators`` upward (3-class problem needs more trees
+    # to separate three boundaries) and set ``class_weight=balanced``
+    # so the 3%-frequency neutral class isn't ignored. The non-LightGBM
+    # base models honour the same ``class_weight`` (XGBoost via
+    # sample_weight translation, LogReg natively).
+    "directional_btc_1h_v1": ModelSpec(
+        name="directional_btc_1h_v1",
+        purpose="directional",
+        label_feature="label_triple_barrier",
+        label_version=1,
+        objective="multiclass",
+        symbol="BTCUSDT",
+        interval="1h",
+        train_start=_TRAIN_START,
+        train_end=_TRAIN_END,
+        hyperparams={
+            "num_leaves": 31,
+            "max_depth": -1,
+            "learning_rate": 0.05,
+            "n_estimators": 800,
+            "min_child_samples": 50,
+            "reg_alpha": 0.0,
+            "reg_lambda": 0.0,
+            "subsample": 0.8,
+            "subsample_freq": 1,
+            "colsample_bytree": 0.8,
+            "random_state": 42,
+            "verbosity": -1,
+            "class_weight": "balanced",
+        },
+        base_models=("lightgbm", "xgboost", "logreg_l1"),
+        meta_label_enabled=True,
+        # M5g.5: stack 1h (serving) + 15m for 4× sample-size uplift.
+        # The 15m branch uses the same triple-barrier algorithm
+        # (k_tp=1.5, k_sl=1.0, horizon=24 bars) but at 15m cadence, so
+        # the per-interval semantics differ — 1h horizon=24h, 15m
+        # horizon=6h. The model conditions on ``interval_indicator``
+        # to differentiate. Inference uses the 1h-only path.
+        training_intervals=("1h", "15m"),
+        # M5g.7: per-fold correlation + MI feature selection.
+        feature_selection_enabled=True,
+    ),
+}
+
+
+def get_spec(name: str) -> ModelSpec:
+    if name not in SPECS:
+        known = ", ".join(sorted(SPECS.keys()))
+        raise KeyError(f"Unknown model spec '{name}'. Known: {known}")
+    return SPECS[name]

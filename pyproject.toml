@@ -1,0 +1,57 @@
+[project]
+name = "blackheart-train"
+version = "0.1.0"
+description = "Blackheart ML/sentiment training worker. Reads feature_values + labels from Postgres, trains LightGBM sub-models, writes content-addressed artifacts. Home-box only; CLI-first per blueprint § 19."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Proprietary" }
+
+dependencies = [
+    "pydantic>=2.9,<3",
+    "pydantic-settings>=2.6,<3",
+    "psycopg[binary]>=3.2,<4",
+    "pandas>=2.2,<3",
+    "numpy>=1.26,<3",
+    "lightgbm>=4.5,<5",
+    "xgboost>=2.0,<3",
+    "scikit-learn>=1.5,<2",
+    "structlog>=24.4,<26",
+    # Used by Phase E shadow_analytics for .to_markdown() output.
+    "tabulate>=0.9,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3,<9",
+    "ruff>=0.7,<1",
+]
+
+[project.scripts]
+blackheart-train = "blackheart_train.cli:main"
+# Phase 4 / Phase E shadow-prediction analytics. Joins signal_history
+# to feature_values labels and produces a calibration / AUC / drift
+# markdown report. Runs against backfilled predictions; doesn't touch
+# training.
+blackheart-train-analyze-shadow = "blackheart_train.shadow_analytics:main"
+# Phase 4 / D-execution backtest-validation prerequisite. Replays
+# walk-forward OOF predictions from an artifact into signal_history so
+# the Java backtest can serve them point-in-time via getAt(ts).
+blackheart-train-backfill-oof = "blackheart_train.oof_backfill:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/blackheart_train"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "RUF"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
