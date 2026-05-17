@@ -52,7 +52,7 @@ from sklearn.metrics import (
 )
 
 from .artifacts import compute_content_sha
-from .integrity import IntegrityError, check_dataset
+from .integrity import IntegrityError, check_dataset, recompute_verdict
 from .loader import LoadedDataset, load_dataset, load_stacked_dataset
 from .specs import ModelSpec
 
@@ -725,12 +725,32 @@ def fit_and_evaluate(
     return model.booster_, metrics
 
 
-def run_integrity_or_raise(ds: LoadedDataset, spec: ModelSpec):
+def run_integrity_or_raise(
+    ds: LoadedDataset, spec: ModelSpec, *, allow_leakage: bool = False,
+):
     """Run the integrity report, log it, and raise :class:`IntegrityError`
     on FAIL. Shared by every code path that wants to honour the gate
     before doing work.
+
+    ``allow_leakage=True`` (CLI --allow-leakage) demotes a label-leakage
+    FAIL to WARN so the run can continue — the check still records its
+    findings in ``integrity.leakage_report``. Other FAIL checks are
+    NOT affected; they still raise.
     """
     integrity = check_dataset(ds, spec)
+
+    # R1.B: --allow-leakage demotes ONLY the label_leakage check. The
+    # demotion mutates the CheckResult and recomputes the overall verdict
+    # so downstream logging + the artifact payload reflect the operator's
+    # explicit decision. The leakage_report dict is left intact for the
+    # audit trail.
+    if allow_leakage:
+        for c in integrity.checks:
+            if c.name == "label_leakage" and c.severity == "FAIL":
+                c.severity = "WARN"
+                c.message = "[--allow-leakage] " + c.message
+        integrity.verdict = recompute_verdict(integrity.checks)
+
     fail_names = [c.name for c in integrity.checks if c.severity == "FAIL"]
     warn_names = [c.name for c in integrity.checks if c.severity == "WARN"]
     logger.info(
@@ -914,6 +934,11 @@ def build_payload(
                 for c in integrity.checks
             ],
         },
+        # R1.B: detached snapshot of the label-leakage check's details so
+        # the CLI can stamp it into experiment_run.leakage_report (V92)
+        # without walking integrity.checks. None when the check was
+        # skipped via check_dataset(skip_leakage=True).
+        "leakage_report": integrity.leakage_report,
         "spec": spec_dict,
         "feature_names": ds.feature_names,
         "booster": None if is_ensemble else booster,
@@ -939,20 +964,25 @@ def build_payload(
     }
 
 
-def train_with_dataset(ds: LoadedDataset, spec: ModelSpec) -> dict[str, Any]:
+def train_with_dataset(
+    ds: LoadedDataset, spec: ModelSpec, *, allow_leakage: bool = False,
+) -> dict[str, Any]:
     """Train using a chronological 80/20 split on an already-loaded dataset.
 
     The saved booster is the 80/20 fit; ``metrics`` is the holdout 20%.
     Used by the M5a/M5b path. The walk-forward path lives in
     ``walk_forward.train_via_walk_forward`` and saves the last fold's
     booster instead.
+
+    ``allow_leakage`` (R1.B): when True, demotes the label-leakage FAIL
+    to WARN. The check still runs + populates ``payload['leakage_report']``.
     """
     logger.info(
         "loaded | spec=%s bar_slots=%d dropped_nan=%d features=%d label=%s",
         spec.name, ds.n_bar_slots_total, ds.n_bar_slots_dropped_nan,
         len(ds.feature_names), spec.label_feature,
     )
-    integrity = run_integrity_or_raise(ds, spec)
+    integrity = run_integrity_or_raise(ds, spec, allow_leakage=allow_leakage)
 
     X_tr, y_tr, X_val, y_val = split_chronological(ds.X, ds.y, spec.val_fraction)
     if len(X_tr) == 0 or len(X_val) == 0:

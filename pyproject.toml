@@ -18,6 +18,9 @@ dependencies = [
     "structlog>=24.4,<26",
     # Used by Phase E shadow_analytics for .to_markdown() output.
     "tabulate>=0.9,<1",
+    # R2.S1 (2026-05-17): Bayesian hyperparameter search via TPESampler.
+    # Replaces the M5b 8-point grid with a configurable search space.
+    "optuna>=4.0,<5",
 ]
 
 [project.optional-dependencies]

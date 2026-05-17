@@ -11,7 +11,7 @@ label via the trained spec), then reports:
   of class=1
 * Per-month performance drift
 
-The CLI saves a markdown report to ``blackheart/research/`` so the
+The CLI saves a markdown report to ``blackheart-trading-engine/research/`` so the
 operator can review verbatim. Stdout shows the same tables for quick
 inspection.
 

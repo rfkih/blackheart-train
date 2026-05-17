@@ -6,15 +6,22 @@ NaN need to be replaced with ``null`` before serialisation. We test
 this in isolation rather than running the full CLI because the
 contract is "no NaN escapes to JSON," and that's easiest to assert at
 the helper boundary.
+
+R2.S4 adds a thin set of argparse-validation tests that exercise the
+mutual-exclusion + requires-X rules without triggering get_settings() /
+DB connection. Pattern: drive ``main(argv)`` and catch ``SystemExit``
+(argparse's ``parser.error`` raises SystemExit(2) with the error on
+stderr).
 """
 from __future__ import annotations
 
 import json
 import math
+import sys
 
 import pytest
 
-from blackheart_train.cli import _json_default, _sanitize_for_json
+from blackheart_train.cli import _json_default, _sanitize_for_json, main
 
 
 def test_sanitize_replaces_nan_with_none():
@@ -94,3 +101,57 @@ def test_json_default_handles_datetime_and_path(tmp_path):
     assert out == "2026-05-15T12:00:00"
     out = _json_default(tmp_path)
     assert isinstance(out, str)
+
+
+# ── R2.S4 — argparse validation tests ────────────────────────────────────
+
+
+def _run_main(argv: list[str]) -> int:
+    """Drive ``main(argv)`` and return the exit code. argparse's
+    ``parser.error`` raises SystemExit(2); we catch and surface the code.
+    """
+    try:
+        return main(argv)
+    except SystemExit as e:
+        # argparse parser.error → SystemExit(2). Treat 0/None as success
+        # via the int(...) coercion.
+        return int(e.code) if e.code is not None else 0
+
+
+def test_cli_rejects_bayesian_and_search_together(capsys):
+    """--bayesian and --search are mutually exclusive."""
+    code = _run_main(["--model", "regime_btc_v1", "--bayesian", "--search"])
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "mutually exclusive" in err
+
+
+def test_cli_rejects_stack_top_k_without_bayesian(capsys):
+    """--stack-top-k > 0 requires --bayesian."""
+    code = _run_main(["--model", "regime_btc_v1", "--stack-top-k", "3"])
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "requires --bayesian" in err
+
+
+def test_cli_rejects_negative_stack_top_k(capsys):
+    code = _run_main(["--model", "regime_btc_v1", "--stack-top-k", "-1"])
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "stack-top-k" in err
+
+
+def test_cli_rejects_zero_bayesian_trials(capsys):
+    code = _run_main(["--model", "regime_btc_v1", "--bayesian", "--bayesian-trials", "0"])
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "bayesian-trials" in err
+
+
+def test_cli_rejects_zero_bayesian_timeout(capsys):
+    code = _run_main([
+        "--model", "regime_btc_v1", "--bayesian", "--bayesian-timeout-s", "0",
+    ])
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "bayesian-timeout-s" in err

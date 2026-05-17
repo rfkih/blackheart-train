@@ -634,6 +634,7 @@ def train_via_walk_forward(
     embargo_days: int = DEFAULT_EMBARGO_DAYS,
     n_folds: int = DEFAULT_N_FOLDS,
     last_n_folds: int | None = None,
+    allow_leakage: bool = False,
 ) -> dict[str, Any]:
     """Train via walk-forward and save the LAST valid fold's estimator.
 
@@ -662,7 +663,7 @@ def train_via_walk_forward(
         spec.name, ds.n_bar_slots_total, ds.n_bar_slots_dropped_nan,
         len(ds.feature_names), spec.label_feature,
     )
-    integrity = run_integrity_or_raise(ds, spec)
+    integrity = run_integrity_or_raise(ds, spec, allow_leakage=allow_leakage)
 
     result = run_walk_forward(
         ds, spec,

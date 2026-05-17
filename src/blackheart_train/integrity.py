@@ -40,7 +40,14 @@ Checks performed
 6. **stale_tail** — WARN per-feature if the most recent non-null value
    sits more than 168 hours (7 days) before the training window's end.
    Surfaces "feature stopped publishing" mid-training-window.
-7. **data_fingerprint** — sha256 over the contiguous bytes of
+7. **label_leakage** (R1.B, 2026-05-17) — refuses if any feature has
+   |Pearson ρ| (binary/regression) or normalized MI (multiclass) against
+   the label at or above 0.95. Catches the textbook leakage pattern where
+   a derived feature accidentally carries the label or future bars. The
+   Phase 4 regime_btc_v3 lifecycle landed only after manual detection of
+   this kind of bug — automating the gate makes future lifecycles cheaper.
+   Tunable via ``allow_leakage=True`` (demotes FAIL → WARN).
+8. **data_fingerprint** — sha256 over the contiguous bytes of
    ``X.values``, ``y.values``, and the timestamp index. Stable across
    re-runs on identical data; changes the moment any value or timestamp
    changes. Stored in the artifact payload alongside ``content_sha256``
@@ -86,6 +93,11 @@ class IntegrityReport:
     verdict: Severity
     checks: list[CheckResult]
     data_fingerprint: str
+    # R1.B: detached copy of the label-leakage check's details so the CLI
+    # can stamp it into experiment_run.leakage_report (V92 column) without
+    # re-walking ``checks``. None when the check didn't run (e.g.
+    # check_dataset called with skip_leakage=True for test fixtures).
+    leakage_report: dict[str, Any] | None = None
 
 
 # ── Individual checks ──────────────────────────────────────────────────────
@@ -97,6 +109,23 @@ _TRAIN_VAL_BALANCE_TOLERANCE_PCT = 0.10
 _REGRESSION_OUTLIER_STD = 6.0
 _CONSTANT_FEATURE_STD = 1e-12
 _STALE_TAIL_HOURS = 168   # 7 days
+
+# R1.B label-leakage detection. 0.95 catches the "feature is the label
+# plus noise" pattern. Real leakage typically registers ≥ 0.99; the buffer
+# absorbs subtler cases (e.g. a feature derived from a one-bar-shifted
+# label). Tighter than 0.95 risks false-positive on legitimate strong
+# predictors (regime score vs regime label can correlate 0.6–0.8); 0.95+
+# is unambiguous.
+_LABEL_LEAKAGE_CORR_THRESHOLD = 0.95
+# Top-K offending features surfaced in the report. The CLI logs the full
+# list; the leakage_report JSONB (V92) stores them so a post-mortem can
+# trace which feature was the culprit.
+_LABEL_LEAKAGE_TOP_K = 5
+# For multiclass labels Pearson is meaningless (label is categorical).
+# We fall back to ``mutual_info_classif`` on a downsample for speed —
+# MI on 100k+ rows × 50 features takes ~30s, and we'd rather pay <2s
+# every train than burn that compute on every invocation.
+_LABEL_LEAKAGE_MI_SAMPLE = 5_000
 # Multiclass thresholds (directional model / triple-barrier — 3 classes).
 # Minority pct threshold is lower than binary's 15% because triple-barrier
 # data is naturally skewed: with TP and SL barriers that converge on the
@@ -327,7 +356,210 @@ def _check_stale_tail(ds: LoadedDataset, spec: ModelSpec) -> CheckResult:
     )
 
 
+# ── Label-leakage detection (R1.B) ─────────────────────────────────────────
+
+
+def _pearson_corr_vs_label(X: pd.DataFrame, y: pd.Series) -> dict[str, float]:
+    """|Pearson ρ| between each column of ``X`` and ``y``.
+
+    Returns a dict ``{feature: |corr|}``. Constant features (std=0) are
+    omitted — Pearson is undefined and they'd otherwise yield NaN. The
+    constant-features check already surfaces them as WARN; double-flagging
+    here adds noise.
+
+    Vectorised — avoids Python-loop overhead even with 200 features × 50k
+    rows. Uses float64 to keep precision stable across pandas backends.
+    """
+    y_arr = y.astype("float64").to_numpy()
+    y_centered = y_arr - y_arr.mean()
+    y_norm = np.linalg.norm(y_centered)
+    if y_norm == 0.0:
+        return {}
+    X_arr = X.astype("float64").to_numpy()
+    X_centered = X_arr - X_arr.mean(axis=0)
+    X_norms = np.linalg.norm(X_centered, axis=0)
+    out: dict[str, float] = {}
+    for i, name in enumerate(X.columns):
+        if X_norms[i] == 0.0:
+            continue
+        rho = float((X_centered[:, i] @ y_centered) / (X_norms[i] * y_norm))
+        out[str(name)] = float(abs(rho))
+    return out
+
+
+def _normalized_mi_vs_label(X: pd.DataFrame, y: pd.Series) -> dict[str, float]:
+    """Mutual information per feature, normalized to ``[0, 1]`` by H(y).
+
+    For multiclass labels Pearson is meaningless (the label codes 0/1/2
+    are categorical, not ordinal). MI handles arbitrary discrete labels.
+    Normalizing by H(y) puts MI on the same 0..1 scale as |Pearson| so
+    the same _LABEL_LEAKAGE_CORR_THRESHOLD applies uniformly.
+
+    Downsamples to ``_LABEL_LEAKAGE_MI_SAMPLE`` rows to keep wall-clock
+    under ~2 seconds. The downsample is chronologically stratified
+    (every N-th row) so the slice still spans the training window — a
+    random downsample on autocorrelated time-series would inflate MI.
+    """
+    from sklearn.feature_selection import mutual_info_classif  # type: ignore[import-untyped]
+
+    n = len(X)
+    if n > _LABEL_LEAKAGE_MI_SAMPLE:
+        stride = n // _LABEL_LEAKAGE_MI_SAMPLE
+        idx = np.arange(0, n, stride)[:_LABEL_LEAKAGE_MI_SAMPLE]
+        X_s = X.iloc[idx]
+        y_s = y.iloc[idx]
+    else:
+        X_s, y_s = X, y
+
+    # Bug-#4 fix (2026-05-17): factorize the label before passing it to
+    # mutual_info_classif. Sparse / negative codes (e.g. {-1, 0, 1} or
+    # {0, 2, 5}) bias sklearn's MI estimator — it doesn't reindex
+    # internally. pd.factorize returns 0..num_classes-1 unique codes so
+    # the MI computation is on the canonical form. H(y) is computed from
+    # the SAME factorized array — using bincount on the original codes
+    # with `- y_arr.min()` worked for contiguous-with-offset labels but
+    # broke on sparse codes (bincount would allocate huge zero-filled
+    # buckets).
+    raw_y = y_s.astype("int64").to_numpy()
+    factorized, _ = pd.factorize(raw_y)   # → 0..k-1, dense
+    counts = np.bincount(factorized)
+    probs = counts[counts > 0] / counts.sum()
+    h_y = float(-(probs * np.log(probs)).sum())
+    if h_y <= 0.0:
+        return {}
+
+    mi = mutual_info_classif(
+        X_s.astype("float64").to_numpy(),
+        factorized,
+        discrete_features=False,
+        random_state=0,
+    )
+    return {str(name): float(mi[i] / h_y) for i, name in enumerate(X.columns)}
+
+
+def _check_label_leakage(ds: LoadedDataset, spec: ModelSpec) -> CheckResult:
+    """Flag features that carry near-perfect information about the label.
+
+    Binary + regression → |Pearson ρ| against ``y``.
+    Multiclass → normalized MI against ``y`` (Pearson is meaningless on
+    categorical labels).
+
+    Threshold is :data:`_LABEL_LEAKAGE_CORR_THRESHOLD` (0.95). Above that
+    the feature is almost certainly the label, a one-bar-shifted derivative,
+    or a future-bar leak. Severity FAIL with the offending feature(s) in
+    details. ``run_integrity_or_raise`` honours ``allow_leakage`` to demote
+    FAIL → WARN when an operator explicitly opts in.
+
+    Always populates ``details`` with the full ranking (top-K) so the
+    CLI can stamp it into ``experiment_run.leakage_report`` regardless of
+    verdict — useful for trend-tracking the highest non-leaking
+    correlations across runs.
+    """
+    if spec.objective == "multiclass":
+        corrs = _normalized_mi_vs_label(ds.X, ds.y)
+        method = "mutual_info_norm"
+    else:
+        corrs = _pearson_corr_vs_label(ds.X, ds.y)
+        method = "pearson_abs"
+
+    if not corrs:
+        # Empty corr map = constant label or no usable features (the
+        # constant-features / class-balance checks have already flagged
+        # this; nothing useful to add here).
+        return CheckResult(
+            name="label_leakage", severity="PASS",
+            message="leakage check skipped (no usable features)",
+            details={"method": method, "threshold": _LABEL_LEAKAGE_CORR_THRESHOLD},
+        )
+
+    ranked = sorted(corrs.items(), key=lambda kv: kv[1], reverse=True)
+    top_offenders = [{"feature": name, "score": round(score, 6)} for name, score in ranked[:_LABEL_LEAKAGE_TOP_K]]
+    max_feature, max_score = ranked[0]
+    details: dict[str, Any] = {
+        "method": method,
+        "threshold": _LABEL_LEAKAGE_CORR_THRESHOLD,
+        "max_score": round(max_score, 6),
+        "max_score_feature": max_feature,
+        "top_offenders": top_offenders,
+    }
+
+    leaking = [(n, s) for n, s in ranked if s >= _LABEL_LEAKAGE_CORR_THRESHOLD]
+    if leaking:
+        leaking_names = [n for n, _ in leaking]
+        details["leaking_features"] = leaking_names
+        return CheckResult(
+            name="label_leakage", severity="FAIL",
+            message=(
+                f"{len(leaking)} feature(s) at or above {method} threshold "
+                f"{_LABEL_LEAKAGE_CORR_THRESHOLD}: {leaking_names[:3]}"
+                f"{'…' if len(leaking) > 3 else ''} (max {max_feature}={max_score:.3f})"
+            ),
+            details=details,
+        )
+    return CheckResult(
+        name="label_leakage", severity="PASS",
+        message=f"max {method} {max_feature}={max_score:.3f} below threshold {_LABEL_LEAKAGE_CORR_THRESHOLD}",
+        details=details,
+    )
+
+
 # ── Fingerprint ────────────────────────────────────────────────────────────
+
+
+def compute_dataset_sha(ds: LoadedDataset, spec: ModelSpec) -> str:
+    """Coarse schema-and-range fingerprint of a loaded dataset.
+
+    Sibling to :func:`compute_data_fingerprint`, but deliberately coarse.
+    Hashes only ``(symbol, interval, label_feature, label_version, X.shape,
+    y.shape, X.index.min(), X.index.max(), feature_names sorted)``.
+
+    Same shape + same window + same feature set → same sha, even if the
+    cell values differ (e.g. a backfill rerun produced slightly different
+    fundamentals). data_fingerprint changes whenever any byte changes;
+    dataset_sha is stable under that. Use them together:
+
+      * Two runs with same dataset_sha + same data_fingerprint = bit-exact
+        re-train.
+      * Two runs with same dataset_sha but different data_fingerprint =
+        same dataset *schema*, refreshed underlying values.
+      * Different dataset_sha = comparing apples to oranges.
+
+    The orchestrator's :class:`experiment_run.dataset_sha` column carries
+    this so leaderboard filtering can answer "all runs against this dataset
+    shape" cleanly.
+    """
+    h = hashlib.sha256()
+    h.update(b"symbol|")
+    h.update((spec.symbol or "").encode("utf-8"))
+    h.update(b"|interval|")
+    h.update((spec.interval or "").encode("utf-8"))
+    h.update(b"|label|")
+    h.update(ds.label_feature.encode("utf-8"))
+    h.update(b"|label_version|")
+    h.update(str(ds.label_version).encode("utf-8"))
+    h.update(b"|X.shape|")
+    h.update(f"{ds.X.shape[0]},{ds.X.shape[1]}".encode("utf-8"))
+    h.update(b"|y.shape|")
+    h.update(str(ds.y.shape[0]).encode("utf-8"))
+    # Bug-#3 fix (2026-05-17): floor to seconds before isoformat. The
+    # naive isoformat preserves microseconds, which means two load paths
+    # reading the same data at different precisions (feature_store at
+    # µs vs a CSV reload at sec) would churn the dataset_sha for the
+    # same semantic dataset. Hourly bars never need sub-second precision
+    # — the floor is a no-op on real bar data and absorbs precision
+    # drift on the edge cases.
+    h.update(b"|ts.min|")
+    h.update(pd.Timestamp(ds.X.index.min()).floor("s").isoformat().encode("utf-8"))
+    h.update(b"|ts.max|")
+    h.update(pd.Timestamp(ds.X.index.max()).floor("s").isoformat().encode("utf-8"))
+    h.update(b"|features|")
+    # Sorted so column-order changes (e.g. a new ingest cron reorders the
+    # registry query) don't churn the sha. Real feature changes — adds /
+    # removes — DO change it.
+    for name in sorted(ds.feature_names):
+        h.update(name.encode("utf-8"))
+        h.update(b"|")
+    return h.hexdigest()
 
 
 def compute_data_fingerprint(ds: LoadedDataset) -> str:
@@ -369,11 +601,20 @@ def _worst(severities: list[Severity]) -> Severity:
     return max(severities, key=lambda s: _SEVERITY_RANK[s])
 
 
+def recompute_verdict(checks: list[CheckResult]) -> Severity:
+    """Public wrapper over :func:`_worst` for callers that mutate a check's
+    severity (e.g. ``run_integrity_or_raise(allow_leakage=True)`` demoting
+    leakage FAIL → WARN) and need to refresh ``IntegrityReport.verdict``.
+    """
+    return _worst([c.severity for c in checks])
+
+
 def check_dataset(
     ds: LoadedDataset,
     spec: ModelSpec,
     *,
     min_rows: int = _MIN_ROWS_DEFAULT,
+    skip_leakage: bool = False,
 ) -> IntegrityReport:
     """Run all integrity checks and return an aggregated report.
 
@@ -382,6 +623,11 @@ def check_dataset(
         meaningless on this data)
       * ``WARN`` → log + persist in the artifact payload
       * ``PASS`` → proceed quietly
+
+    ``skip_leakage`` is a test-only escape hatch. The ``--allow-leakage``
+    CLI flag does NOT use it — that flag wants the check to RUN (to record
+    the leakage_report) but demote FAIL→WARN. ``run_integrity_or_raise``
+    handles the demotion downstream.
     """
     checks: list[CheckResult] = [
         _check_min_rows(ds, min_rows),
@@ -396,6 +642,20 @@ def check_dataset(
     else:
         checks.append(_check_regression_label_distribution(ds))
 
+    leakage_details: dict[str, Any] | None = None
+    if not skip_leakage:
+        leakage = _check_label_leakage(ds, spec)
+        checks.append(leakage)
+        # Always surface the leakage details — even on PASS — so the
+        # experiment_run.leakage_report column carries an audit trail of
+        # "max correlation we saw" per run.
+        leakage_details = dict(leakage.details)
+        leakage_details["severity"] = leakage.severity
+        leakage_details["message"] = leakage.message
+
     fingerprint = compute_data_fingerprint(ds)
     verdict = _worst([c.severity for c in checks])
-    return IntegrityReport(verdict=verdict, checks=checks, data_fingerprint=fingerprint)
+    return IntegrityReport(
+        verdict=verdict, checks=checks, data_fingerprint=fingerprint,
+        leakage_report=leakage_details,
+    )

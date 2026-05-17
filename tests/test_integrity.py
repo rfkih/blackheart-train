@@ -17,6 +17,7 @@ from blackheart_train.integrity import (
     IntegrityError,
     check_dataset,
     compute_data_fingerprint,
+    compute_dataset_sha,
 )
 from blackheart_train.loader import LoadedDataset
 from blackheart_train.specs import get_spec
@@ -261,3 +262,202 @@ def test_verdict_is_worst_of():
 def test_integrity_error_is_raisable():
     with pytest.raises(IntegrityError):
         raise IntegrityError("test")
+
+
+# ── R1.B Label-leakage detection ───────────────────────────────────────────
+
+
+def test_label_leakage_fail_on_mirror_feature():
+    """A feature that IS the label (perfect Pearson ρ=1.0) must FAIL.
+
+    This is the canonical leakage pattern: the loader joined the label
+    column into the feature set by accident, or a derived feature copied
+    the label one bar early. Either way the check has to catch it before
+    LightGBM time burns.
+    """
+    n = 2000
+    label = (np.arange(n) % 2).astype("float64")
+    features = {
+        "f_clean": np.random.default_rng(0).standard_normal(n),
+        # Leaks the label directly — |ρ| = 1.0
+        "f_leak": label.copy(),
+    }
+    ds = _make_dataset(n=n, features=features, label=label)
+    spec = get_spec("regime_btc_v1")
+    report = check_dataset(ds, spec)
+
+    assert report.verdict == "FAIL", report.verdict
+    leak = next(c for c in report.checks if c.name == "label_leakage")
+    assert leak.severity == "FAIL"
+    assert leak.details["max_score_feature"] == "f_leak"
+    assert leak.details["max_score"] >= 0.95
+    assert "f_leak" in leak.details["leaking_features"]
+    # leakage_report on the IntegrityReport mirror is populated for both
+    # PASS and FAIL — checked here on the FAIL path so the CLI can stamp
+    # the experiment_run.leakage_report column either way.
+    assert report.leakage_report is not None
+    assert report.leakage_report["severity"] == "FAIL"
+
+
+def test_label_leakage_pass_on_moderate_correlation():
+    """A feature that's strongly correlated but NOT the label should PASS.
+
+    A real predictor (e.g. rsi_14 against a forward-return label) can run
+    |ρ| up to ~0.6–0.7. The check needs headroom to distinguish "real
+    signal" from "the label moved into the feature matrix."
+    """
+    n = 2000
+    label = (np.arange(n) % 2).astype("float64")
+    rng = np.random.default_rng(42)
+    # Correlated signal: label * 0.5 + noise — |ρ| around 0.55.
+    f_signal = label * 0.5 + rng.standard_normal(n) * 0.7
+    features = {
+        "f_clean": rng.standard_normal(n),
+        "f_signal": f_signal,
+    }
+    ds = _make_dataset(n=n, features=features, label=label)
+    spec = get_spec("regime_btc_v1")
+    report = check_dataset(ds, spec)
+
+    leak = next(c for c in report.checks if c.name == "label_leakage")
+    assert leak.severity == "PASS", (leak.message, leak.details)
+    # max_score is recorded even on PASS so the operator can track the
+    # highest non-leaking correlation across runs.
+    assert leak.details["max_score"] < 0.95
+
+
+def test_allow_leakage_demotes_fail_to_warn():
+    """``run_integrity_or_raise(allow_leakage=True)`` should turn the
+    leakage FAIL into a WARN, keep the leakage_report intact, and NOT raise.
+    """
+    from blackheart_train.train import run_integrity_or_raise
+
+    n = 2000
+    label = (np.arange(n) % 2).astype("float64")
+    features = {
+        "f_clean": np.random.default_rng(7).standard_normal(n),
+        "f_leak": label.copy(),
+    }
+    ds = _make_dataset(n=n, features=features, label=label)
+    spec = get_spec("regime_btc_v1")
+
+    # Default: must raise.
+    with pytest.raises(IntegrityError):
+        run_integrity_or_raise(ds, spec)
+
+    # With allow_leakage=True: returns the report, leakage demoted to WARN.
+    report = run_integrity_or_raise(ds, spec, allow_leakage=True)
+    leak = next(c for c in report.checks if c.name == "label_leakage")
+    assert leak.severity == "WARN"
+    assert "[--allow-leakage]" in leak.message
+    # The overall verdict reflects the demotion — should be at most WARN
+    # (other checks may also WARN, but no FAIL remains).
+    assert report.verdict in ("WARN", "PASS")
+    # The audit-trail data is preserved.
+    assert report.leakage_report is not None
+    assert report.leakage_report["max_score_feature"] == "f_leak"
+
+
+def test_label_leakage_skipped_for_constant_features_only():
+    """If every feature has zero variance, the leakage check has nothing
+    to compute and should report PASS with a clear message (the constant-
+    features check independently surfaces them as WARN).
+    """
+    n = 2000
+    label = (np.arange(n) % 2).astype("float64")
+    features = {
+        "f_const_a": np.full(n, 1.0),
+        "f_const_b": np.full(n, 2.0),
+    }
+    ds = _make_dataset(n=n, features=features, label=label)
+    spec = get_spec("regime_btc_v1")
+    report = check_dataset(ds, spec)
+    leak = next(c for c in report.checks if c.name == "label_leakage")
+    assert leak.severity == "PASS"
+    # No features had non-zero variance, so the corrs map was empty.
+    assert "skipped" in leak.message
+
+
+# ── R1 close-out: compute_dataset_sha ─────────────────────────────────────
+
+
+def test_dataset_sha_stable_for_same_shape_and_window():
+    """Two datasets with the same (symbol, interval, label, shape, range,
+    features) produce the same dataset_sha even if the cell values differ.
+    That's the contract — dataset_sha is the *coarse* fingerprint.
+    """
+    n = 1500
+    rng_a = np.random.default_rng(1)
+    rng_b = np.random.default_rng(2)
+    ds_a = _make_dataset(
+        n=n, features={"f0": rng_a.standard_normal(n), "f1": rng_a.standard_normal(n)},
+    )
+    ds_b = _make_dataset(
+        n=n, features={"f0": rng_b.standard_normal(n), "f1": rng_b.standard_normal(n)},
+    )
+    spec = get_spec("regime_btc_v1")
+    sha_a = compute_dataset_sha(ds_a, spec)
+    sha_b = compute_dataset_sha(ds_b, spec)
+    assert sha_a == sha_b, "different values must NOT change the coarse sha"
+    # data_fingerprint, in contrast, MUST differ — it's bit-exact.
+    assert compute_data_fingerprint(ds_a) != compute_data_fingerprint(ds_b)
+
+
+def test_dataset_sha_changes_when_shape_changes():
+    n = 1500
+    ds_full = _make_dataset(n=n)
+    ds_short = _make_dataset(n=n - 100)
+    spec = get_spec("regime_btc_v1")
+    assert compute_dataset_sha(ds_full, spec) != compute_dataset_sha(ds_short, spec)
+
+
+def test_dataset_sha_changes_when_symbol_changes():
+    ds = _make_dataset(n=1500)
+    spec_btc = get_spec("regime_btc_v1")
+    spec_eth = replace(spec_btc, symbol="ETHUSDT")
+    assert compute_dataset_sha(ds, spec_btc) != compute_dataset_sha(ds, spec_eth)
+
+
+def test_dataset_sha_changes_when_features_change():
+    n = 1500
+    ds_a = _make_dataset(n=n, features={"f0": np.zeros(n), "f1": np.zeros(n)})
+    ds_b = _make_dataset(n=n, features={"f0": np.zeros(n), "f2": np.zeros(n)})
+    spec = get_spec("regime_btc_v1")
+    assert compute_dataset_sha(ds_a, spec) != compute_dataset_sha(ds_b, spec)
+
+
+def test_dataset_sha_independent_of_feature_order():
+    """Column order changes (e.g. a registry-query reorder) must NOT churn
+    the sha — feature_names is sorted in the hash by design.
+    """
+    n = 1500
+    arr0 = np.random.default_rng(0).standard_normal(n)
+    arr1 = np.random.default_rng(1).standard_normal(n)
+    ds_ab = _make_dataset(n=n, features={"f_a": arr0, "f_b": arr1})
+    ds_ba = _make_dataset(n=n, features={"f_b": arr1, "f_a": arr0})
+    spec = get_spec("regime_btc_v1")
+    # Note: data_fingerprint WOULD differ here (column order is part of
+    # the byte stream). dataset_sha does NOT.
+    assert compute_dataset_sha(ds_ab, spec) == compute_dataset_sha(ds_ba, spec)
+
+
+def test_label_leakage_multiclass_path():
+    """For multiclass labels, the check uses normalized MI instead of
+    Pearson. Confirm the multiclass branch flags a perfect-info feature.
+    """
+    n = 2000
+    # Triple-barrier-style 3-class label: 0, 1, 2 cycling.
+    label = (np.arange(n) % 3).astype("float64")
+    features = {
+        "f_noise": np.random.default_rng(0).standard_normal(n),
+        # Encodes the label exactly — MI / H(y) should hit 1.0.
+        "f_leak": label.copy(),
+    }
+    ds = _make_dataset(n=n, features=features, label=label)
+    spec = replace(get_spec("regime_btc_v1"), objective="multiclass")
+    report = check_dataset(ds, spec)
+    leak = next(c for c in report.checks if c.name == "label_leakage")
+    assert leak.severity == "FAIL", (leak.message, leak.details)
+    assert leak.details["method"] == "mutual_info_norm"
+    assert leak.details["max_score_feature"] == "f_leak"
+    assert leak.details["max_score"] >= 0.95
