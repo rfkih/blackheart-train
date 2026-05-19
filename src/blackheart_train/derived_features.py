@@ -42,6 +42,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 import psycopg
+from numpy.lib.stride_tricks import sliding_window_view
 
 from .specs import ModelSpec
 
@@ -212,27 +213,29 @@ def _t_label_triple_barrier(md: dict[str, pd.DataFrame]) -> pd.Series:
     atr = _atr(df_btc, atr_window).to_numpy()
     n = len(c)
     out = np.full(n, np.nan, dtype="float64")
-    for t in range(n):
-        atr_t = atr[t]
-        if not np.isfinite(atr_t) or atr_t <= 0:
-            continue
-        last_bar = t + horizon_bars
-        if last_bar >= n:
-            continue
-        entry = c[t]
-        tp_level = entry + k_tp * atr_t
-        sl_level = entry - k_sl * atr_t
-        label = 0  # default: horizon timeout
-        for bar in range(t + 1, last_bar + 1):
-            sl_hit = lo[bar] <= sl_level
-            tp_hit = h[bar] >= tp_level
-            if sl_hit:
-                label = -1
-                break
-            if tp_hit:
-                label = 1
-                break
-        out[t] = float(label)
+    last_t = n - horizon_bars
+    if last_t <= 0:
+        return pd.Series(out, index=df_btc.index, name="label_triple_barrier")
+    # Future-bar windows: h_win[t] = h[t+1 .. t+horizon_bars] (size horizon_bars).
+    h_win = sliding_window_view(h, horizon_bars)[1 : 1 + last_t]
+    lo_win = sliding_window_view(lo, horizon_bars)[1 : 1 + last_t]
+    entry = c[:last_t]
+    atr_v = atr[:last_t]
+    tp_lvl = entry + k_tp * atr_v
+    sl_lvl = entry - k_sl * atr_v
+    sl_hit = lo_win <= sl_lvl[:, None]
+    tp_hit = h_win >= tp_lvl[:, None]
+    sl_any = sl_hit.any(axis=1)
+    tp_any = tp_hit.any(axis=1)
+    sl_idx = np.where(sl_any, sl_hit.argmax(axis=1), horizon_bars)
+    tp_idx = np.where(tp_any, tp_hit.argmax(axis=1), horizon_bars)
+    labels = np.zeros(last_t, dtype="float64")
+    labels[sl_idx < tp_idx] = -1.0
+    labels[tp_idx < sl_idx] = 1.0
+    # Intra-bar tie: SL wins (matches the original loop's order-of-checks).
+    labels[(sl_idx == tp_idx) & sl_any] = -1.0
+    labels[~(np.isfinite(atr_v) & (atr_v > 0))] = np.nan
+    out[:last_t] = labels
     return pd.Series(out, index=df_btc.index, name="label_triple_barrier")
 
 

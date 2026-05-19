@@ -2,7 +2,9 @@
   "permissions": {
     "allow": [
       "Bash(.venv/Scripts/python.exe -m pytest tests/test_ensemble.py -x --tb=short)",
-      "Bash(.venv/Scripts/python.exe -m pytest tests/ --tb=short)"
+      "Bash(.venv/Scripts/python.exe -m pytest tests/ --tb=short)",
+      "Bash(Get-Service -Name \"*blackheart*\" -ErrorAction SilentlyContinue)",
+      "Bash(Format-List Name, Status, DisplayName)"
     ]
   }
 }

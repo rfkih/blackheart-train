@@ -611,7 +611,7 @@ def main(argv: list[str] | None = None) -> int:
     # Share the input-feature matrix across specs only when --model all.
     # Single-spec runs leave this None to keep behaviour bit-identical
     # to the M5a code path.
-    feature_cache: FeatureCache | None = {} if args.model == "all" else None
+    feature_cache: FeatureCache | None = FeatureCache() if args.model == "all" else None
 
     summaries: list[dict[str, Any]] = []
     any_failed = False

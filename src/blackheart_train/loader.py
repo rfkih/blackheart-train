@@ -181,36 +181,112 @@ def _read_per_bar_feature(
     return pd.Series(df["value"].astype("float64").values, index=df["ts"], name=feature_name)
 
 
-def _read_global_feature(
+def _read_per_bar_features_batch(
     conn: psycopg.Connection,
-    feature_name: str,
-    version: int,
+    metas: list[dict[str, Any]],
+    symbol: str,
+    interval: str,
     start: datetime,
     end: datetime,
-) -> pd.Series:
-    """Read one global (symbol='', interval='') feature."""
+) -> dict[tuple[str, int], pd.Series]:
+    """Bulk-read every per-bar feature in ``metas`` for one (symbol, interval).
+
+    One DB round-trip regardless of feature count — replaces the per-feature
+    SELECT loop that used to fan out to ~50 round-trips per spec load.
+    """
+    if not metas:
+        return {}
+    names = [m["feature_name"] for m in metas]
     sql = """
-        SELECT ts, value
+        SELECT feature_name, version, ts, value
         FROM feature_values
-        WHERE feature_name = %(name)s
-          AND version = %(version)s
-          AND symbol = ''
-          AND interval = ''
+        WHERE feature_name = ANY(%(names)s)
+          AND symbol = %(symbol)s
+          AND interval = %(interval)s
           AND ts >= %(start)s
           AND ts < %(end)s
-        ORDER BY ts ASC
+        ORDER BY feature_name, version, ts ASC
     """
     with conn.cursor() as cur:
         cur.execute(sql, {
-            "name": feature_name, "version": version,
+            "names": names,
+            "symbol": symbol, "interval": interval,
             "start": start, "end": end,
         })
         rows = cur.fetchall()
     if not rows:
-        return pd.Series(dtype="float64", name=feature_name)
+        return {}
     df = pd.DataFrame(rows)
     df["ts"] = pd.to_datetime(df["ts"], utc=True).dt.tz_convert(None)
-    return pd.Series(df["value"].astype("float64").values, index=df["ts"], name=feature_name)
+    out: dict[tuple[str, int], pd.Series] = {}
+    for (name, version), group in df.groupby(["feature_name", "version"], sort=False):
+        out[(name, int(version))] = pd.Series(
+            group["value"].astype("float64").values, index=group["ts"], name=name
+        )
+    return out
+
+
+def _read_global_features_batch(
+    conn: psycopg.Connection,
+    metas: list[dict[str, Any]],
+    start: datetime,
+    end: datetime,
+) -> dict[tuple[str, int], pd.Series]:
+    """Bulk-read every global (symbol='', interval='') feature in ``metas``."""
+    if not metas:
+        return {}
+    names = [m["feature_name"] for m in metas]
+    sql = """
+        SELECT feature_name, version, ts, value
+        FROM feature_values
+        WHERE feature_name = ANY(%(names)s)
+          AND symbol = ''
+          AND interval = ''
+          AND ts >= %(start)s
+          AND ts < %(end)s
+        ORDER BY feature_name, version, ts ASC
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, {
+            "names": names,
+            "start": start, "end": end,
+        })
+        rows = cur.fetchall()
+    if not rows:
+        return {}
+    df = pd.DataFrame(rows)
+    df["ts"] = pd.to_datetime(df["ts"], utc=True).dt.tz_convert(None)
+    out: dict[tuple[str, int], pd.Series] = {}
+    for (name, version), group in df.groupby(["feature_name", "version"], sort=False):
+        out[(name, int(version))] = pd.Series(
+            group["value"].astype("float64").values, index=group["ts"], name=name
+        )
+    return out
+
+
+def _project_series_to_grid(
+    series: pd.Series,
+    bar_index: pd.DatetimeIndex,
+    cap_hours: int | None,
+    feature_name: str,
+) -> pd.Series:
+    """Project a sparser source Series onto ``bar_index`` via backward
+    merge_asof with a time-based cap. Used both by the cross-interval ffill
+    path (1h source → 15m grid) and conceptually by the global ffill path
+    (lower-cadence publish → bar grid). Extracted so the batched feature
+    loader can hand off after a single DB read.
+    """
+    if series.empty:
+        return pd.Series(index=bar_index, dtype="float64", name=feature_name)
+    df_grid = pd.DataFrame({"ts": bar_index})
+    df_src = series.to_frame("value").rename_axis("ts").reset_index().sort_values("ts")
+    tolerance = pd.Timedelta(hours=cap_hours) if cap_hours else None
+    merged = pd.merge_asof(
+        df_grid, df_src, on="ts", direction="backward", tolerance=tolerance,
+    )
+    result = merged.set_index("ts")["value"]
+    result.name = feature_name
+    return result
 
 
 # ── Alignment ───────────────────────────────────────────────────────────────
@@ -272,48 +348,67 @@ def _fetch_feature_matrix(conn: psycopg.Connection, spec: ModelSpec) -> _Feature
     """Read every eligible input feature for ``spec``'s window into a
     cache record. No label fetch and no NaN drop — those are the parts
     that vary per sub-model, so they stay in :func:`load_dataset`.
+
+    DB cost: two round-trips (per-bar + global) regardless of feature count.
     """
     inputs_meta = _list_input_features(conn)
+    bar_index = _bar_grid(spec.train_start, spec.train_end, spec.interval)
+
+    per_bar_metas: list[dict[str, Any]] = []
+    global_metas: list[dict[str, Any]] = []
+    for meta in inputs_meta:
+        symbols = meta["symbols"] or []
+        intervals = meta["intervals"] or []
+        is_per_bar = bool(symbols) and bool(intervals)
+        if is_per_bar:
+            if spec.symbol in symbols and spec.interval in intervals:
+                per_bar_metas.append(meta)
+        else:
+            global_metas.append(meta)
+
+    per_bar_data = _read_per_bar_features_batch(
+        conn, per_bar_metas, spec.symbol, spec.interval,
+        spec.train_start, spec.train_end,
+    )
+    global_data = _read_global_features_batch(
+        conn, global_metas, spec.train_start, spec.train_end,
+    )
+
     feature_names: list[str] = []
     cols: dict[str, pd.Series] = {}
     per_feature_non_null: dict[str, int] = {}
-    bar_index = _bar_grid(spec.train_start, spec.train_end, spec.interval)
 
-    for meta in inputs_meta:
+    for meta in per_bar_metas:
         name = meta["feature_name"]
         version = meta["version"]
-        symbols = meta["symbols"] or []
-        intervals = meta["intervals"] or []
-        max_age_h = meta["max_ffill_age_hours"]
-        ffill_policy = meta["ffill_policy"]
-
-        is_per_bar = bool(symbols) and bool(intervals)
-        if is_per_bar:
-            if spec.symbol not in symbols or spec.interval not in intervals:
-                continue
-            series = _read_per_bar_feature(
-                conn, name, version, spec.symbol, spec.interval,
-                spec.train_start, spec.train_end,
-            )
-            aligned = series.reindex(bar_index)
-        else:
-            series = _read_global_feature(
-                conn, name, version, spec.train_start, spec.train_end,
-            )
-            if series.empty:
-                logger.warning("Global feature %s v%d has no rows in window — skipping", name, version)
-                continue
-            if ffill_policy == "last_value":
-                cap = max_age_h if max_age_h else 24 * 7
-                aligned = _ffill_global_to_grid(series, bar_index, cap_hours=cap)
-            else:
-                aligned = series.reindex(bar_index)
-
+        series = per_bar_data.get((name, version), pd.Series(dtype="float64", name=name))
+        aligned = series.reindex(bar_index)
         non_null = int(aligned.notna().sum())
         if non_null == 0:
             logger.warning("Feature %s v%d is all-NaN on the bar grid — skipping", name, version)
             continue
+        feature_names.append(name)
+        cols[name] = aligned
+        per_feature_non_null[name] = non_null
 
+    for meta in global_metas:
+        name = meta["feature_name"]
+        version = meta["version"]
+        max_age_h = meta["max_ffill_age_hours"]
+        ffill_policy = meta["ffill_policy"]
+        series = global_data.get((name, version), pd.Series(dtype="float64", name=name))
+        if series.empty:
+            logger.warning("Global feature %s v%d has no rows in window — skipping", name, version)
+            continue
+        if ffill_policy == "last_value":
+            cap = max_age_h if max_age_h else 24 * 7
+            aligned = _ffill_global_to_grid(series, bar_index, cap_hours=cap)
+        else:
+            aligned = series.reindex(bar_index)
+        non_null = int(aligned.notna().sum())
+        if non_null == 0:
+            logger.warning("Feature %s v%d is all-NaN on the bar grid — skipping", name, version)
+            continue
         feature_names.append(name)
         cols[name] = aligned
         per_feature_non_null[name] = non_null
@@ -326,7 +421,44 @@ def _fetch_feature_matrix(conn: psycopg.Connection, spec: ModelSpec) -> _Feature
     )
 
 
-FeatureCache = dict[tuple[str, str, datetime, datetime], _FeatureMatrixCache]
+@dataclass
+class FeatureCache:
+    """Process-local cache for repeated ``load_dataset`` calls.
+
+    Two cache dicts, each opt-in and only consulted/populated when the
+    cache is threaded into the loader:
+
+    * ``feature_matrices`` — the wide input matrix keyed by
+      ``(symbol, interval, train_start, train_end)``. All three M5
+      sub-models share that key, so ``--model all`` pays the DB cost
+      once across the three labels.
+    * ``market_bundles`` — the OHLCV bundle for derived features/labels,
+      keyed by ``(required_symbols, interval, train_start, train_end)``.
+      Same idea: shared across specs whose derived inputs need the same
+      symbols at the same interval.
+    """
+
+    feature_matrices: dict[tuple[str, str, datetime, datetime], _FeatureMatrixCache] = field(default_factory=dict)
+    market_bundles: dict[tuple[tuple[str, ...], str, datetime, datetime], dict[str, pd.DataFrame]] = field(default_factory=dict)
+
+
+def _get_or_fetch_market_bundle(
+    conn: psycopg.Connection,
+    required: tuple[str, ...],
+    interval: str,
+    start: datetime,
+    end: datetime,
+    cache: FeatureCache | None,
+) -> dict[str, pd.DataFrame]:
+    key = (required, interval, start, end)
+    if cache is not None and key in cache.market_bundles:
+        logger.info("market bundle cache HIT | key=%s", key)
+        return cache.market_bundles[key]
+    bundle = fetch_market_data_bundle(conn, required, interval, start, end)
+    if cache is not None:
+        cache.market_bundles[key] = bundle
+        logger.info("market bundle cache MISS, stored | key=%s", key)
+    return bundle
 
 
 def load_dataset(
@@ -341,38 +473,32 @@ def load_dataset(
     which feature is dragging coverage. Raises ``ValueError`` if the
     resulting matrix is empty.
 
-    Optional ``feature_cache`` — when not None, the input feature matrix
-    is cached by ``(symbol, interval, train_start, train_end)``. The
-    label is always fetched fresh (per-spec). This lets ``--model all``
-    pay the input-side DB cost once and reuse across the three labels.
+    Optional ``feature_cache`` — when not None, both the input feature
+    matrix AND the market_data bundle are memoised. The label is always
+    fetched fresh (per-spec). This lets ``--model all`` pay the input-
+    side DB cost once and reuse across the three labels.
     """
     cache_key = (spec.symbol, spec.interval, spec.train_start, spec.train_end)
     needs_market_data = bool(spec.derived_features) or spec.label_feature in DERIVED_LABELS
     with get_connection() as conn:
-        if feature_cache is not None and cache_key in feature_cache:
-            fmc = feature_cache[cache_key]
+        if feature_cache is not None and cache_key in feature_cache.feature_matrices:
+            fmc = feature_cache.feature_matrices[cache_key]
             logger.info("feature matrix cache HIT | key=%s", cache_key)
         else:
             fmc = _fetch_feature_matrix(conn, spec)
             if feature_cache is not None:
-                feature_cache[cache_key] = fmc
+                feature_cache.feature_matrices[cache_key] = fmc
                 logger.info("feature matrix cache MISS, stored | key=%s", cache_key)
 
         if not fmc.cols:
             raise ValueError("No input features produced any rows on the bar grid.")
 
-        # M5d-followup: fetch market_data once for derived features/label.
-        # We don't cache the market_data bundle yet — it's fetched once
-        # per load_dataset call, which is fine for --model all where each
-        # spec calls load_dataset separately. A future optimisation can
-        # extend feature_cache to memoise this too if it shows up in
-        # profiling.
         market_bundle: dict[str, pd.DataFrame] | None = None
         if needs_market_data:
             required = required_symbols_for(spec)
-            market_bundle = fetch_market_data_bundle(
+            market_bundle = _get_or_fetch_market_bundle(
                 conn, required, spec.interval,
-                spec.train_start, spec.train_end,
+                spec.train_start, spec.train_end, feature_cache,
             )
 
         if spec.label_feature in DERIVED_LABELS:
@@ -443,8 +569,8 @@ def load_dataset(
             f"Per-feature non-null counts: {per_feature_non_null}"
         )
 
-    X_out = cleaned[feature_names_list].copy()
-    y_out = cleaned["__y__"].rename("y").copy()
+    X_out = cleaned[feature_names_list]
+    y_out = cleaned["__y__"].rename("y")
     per_feature_pct = {
         k: round(v / bar_slots_total, 4) for k, v in per_feature_non_null.items()
     }
@@ -496,45 +622,6 @@ def _interval_to_hours(interval: str) -> int:
     return max(1, int(hours))
 
 
-def _fetch_per_bar_feature_xinterval(
-    conn: psycopg.Connection,
-    *,
-    feature_name: str,
-    version: int,
-    symbol: str,
-    source_interval: str,
-    target_bar_index: pd.DatetimeIndex,
-    train_start: datetime,
-    train_end: datetime,
-    cap_hours: int | None,
-) -> pd.Series:
-    """Read a per-bar feature stored at ``source_interval`` (typically
-    "1h") and project it onto ``target_bar_index`` (typically the 15m
-    bar grid) via backward merge_asof with a time-based cap.
-
-    This is the cross-interval ffill path for stacked-interval training:
-    a 1h feature value computed at HH:00 applies to the 15m bars
-    {HH:00, HH:15, HH:30, HH:45} until the next 1h value at (HH+1):00.
-    """
-    src = _read_per_bar_feature(
-        conn, feature_name, version, symbol, source_interval,
-        train_start, train_end,
-    )
-    if src.empty:
-        return pd.Series(index=target_bar_index, dtype="float64", name=feature_name)
-    # merge_asof requires sorted-by-key on both sides. _read_per_bar_feature
-    # returns a sorted Series; target_bar_index is also chronological.
-    df_grid = pd.DataFrame({"ts": target_bar_index})
-    df_src = src.to_frame("value").rename_axis("ts").reset_index().sort_values("ts")
-    tolerance = pd.Timedelta(hours=cap_hours) if cap_hours else None
-    merged = pd.merge_asof(
-        df_grid, df_src, on="ts", direction="backward", tolerance=tolerance,
-    )
-    result = merged.set_index("ts")["value"]
-    result.name = feature_name
-    return result
-
-
 def _fetch_aux_feature_matrix(
     conn: psycopg.Connection,
     spec: ModelSpec,
@@ -549,70 +636,80 @@ def _fetch_aux_feature_matrix(
     * Per-bar features are read from ``spec.interval`` (e.g. 1h) and
       forward-filled onto the aux bar grid (e.g. 15m) via merge_asof.
       Cap = the feature's ``max_ffill_age_hours`` (same policy as
-      load_dataset's global-feature path).
+      load_dataset's global-feature path); else falls back to
+      ``_interval_to_hours(spec.interval)`` so a 1h feature projecting
+      onto 15m bars propagates at most one source-bar period (the MS1
+      fix preserved from the per-feature path).
     * Global features (symbol='', interval='') project onto the aux bar
       grid the same way they project onto the serving grid.
 
     The serving interval's per-feature semantics are preserved — a 1h
     feature's value at 14:00 applies to all 15m bars in [14:00, 15:00).
+
+    DB cost: two round-trips (per-bar + global) regardless of feature count.
     """
     inputs_meta = _list_input_features(conn)
+    bar_index = _bar_grid(spec.train_start, spec.train_end, aux_interval)
+
+    per_bar_metas: list[dict[str, Any]] = []
+    global_metas: list[dict[str, Any]] = []
+    for meta in inputs_meta:
+        symbols = meta["symbols"] or []
+        intervals = meta["intervals"] or []
+        is_per_bar = bool(symbols) and bool(intervals)
+        if is_per_bar:
+            if spec.symbol in symbols and spec.interval in intervals:
+                per_bar_metas.append(meta)
+        else:
+            global_metas.append(meta)
+
+    per_bar_data = _read_per_bar_features_batch(
+        conn, per_bar_metas, spec.symbol, spec.interval,
+        spec.train_start, spec.train_end,
+    )
+    global_data = _read_global_features_batch(
+        conn, global_metas, spec.train_start, spec.train_end,
+    )
+
     feature_names: list[str] = []
     cols: dict[str, pd.Series] = {}
     per_feature_non_null: dict[str, int] = {}
-    bar_index = _bar_grid(spec.train_start, spec.train_end, aux_interval)
 
-    for meta in inputs_meta:
+    for meta in per_bar_metas:
         name = meta["feature_name"]
         version = meta["version"]
-        symbols = meta["symbols"] or []
-        intervals = meta["intervals"] or []
+        max_age_h = meta["max_ffill_age_hours"]
+        cap = int(max_age_h) if max_age_h else _interval_to_hours(spec.interval)
+        src = per_bar_data.get((name, version), pd.Series(dtype="float64", name=name))
+        aligned = _project_series_to_grid(src, bar_index, cap_hours=cap, feature_name=name)
+        non_null = int(aligned.notna().sum())
+        if non_null == 0:
+            logger.warning(
+                "Aux feature %s v%d is all-NaN on the %s bar grid — skipping",
+                name, version, aux_interval,
+            )
+            continue
+        feature_names.append(name)
+        cols[name] = aligned
+        per_feature_non_null[name] = non_null
+
+    for meta in global_metas:
+        name = meta["feature_name"]
+        version = meta["version"]
         max_age_h = meta["max_ffill_age_hours"]
         ffill_policy = meta["ffill_policy"]
-
-        is_per_bar = bool(symbols) and bool(intervals)
-        if is_per_bar:
-            # Source interval is the spec's serving interval (e.g. 1h).
-            # The feature must be registered for spec.symbol there.
-            if spec.symbol not in symbols or spec.interval not in intervals:
-                continue
-            # MS1 fix: cross-interval ffill cap defaults to the
-            # SOURCE bar period (1h for a 1h-cadence feature), not
-            # 168h. Per-bar features are stamped at every native bar
-            # — a stale value at 1h projecting onto 15m should
-            # propagate only to the next source bar period at most.
-            # If the feature carries its own ``max_ffill_age_hours``
-            # (some sparse per-bar features do, e.g. funding_8h with
-            # 8h max_age), honour that — same caller intent as the
-            # global-feature path.
-            if max_age_h:
-                cap = int(max_age_h)
-            else:
-                cap = _interval_to_hours(spec.interval)
-            aligned = _fetch_per_bar_feature_xinterval(
-                conn,
-                feature_name=name, version=version,
-                symbol=spec.symbol, source_interval=spec.interval,
-                target_bar_index=bar_index,
-                train_start=spec.train_start, train_end=spec.train_end,
-                cap_hours=cap,
+        series = global_data.get((name, version), pd.Series(dtype="float64", name=name))
+        if series.empty:
+            logger.warning(
+                "Global feature %s v%d has no rows in window — skipping",
+                name, version,
             )
+            continue
+        if ffill_policy == "last_value":
+            cap_global = max_age_h if max_age_h else 24 * 7
+            aligned = _ffill_global_to_grid(series, bar_index, cap_hours=cap_global)
         else:
-            series = _read_global_feature(
-                conn, name, version, spec.train_start, spec.train_end,
-            )
-            if series.empty:
-                logger.warning(
-                    "Global feature %s v%d has no rows in window — skipping",
-                    name, version,
-                )
-                continue
-            if ffill_policy == "last_value":
-                cap_global = max_age_h if max_age_h else 24 * 7
-                aligned = _ffill_global_to_grid(series, bar_index, cap_hours=cap_global)
-            else:
-                aligned = series.reindex(bar_index)
-
+            aligned = series.reindex(bar_index)
         non_null = int(aligned.notna().sum())
         if non_null == 0:
             logger.warning(
@@ -632,7 +729,12 @@ def _fetch_aux_feature_matrix(
     )
 
 
-def _load_aux_interval_dataset(spec: ModelSpec, aux_interval: str) -> LoadedDataset:
+def _load_aux_interval_dataset(
+    spec: ModelSpec,
+    aux_interval: str,
+    *,
+    feature_cache: FeatureCache | None = None,
+) -> LoadedDataset:
     """Build a LoadedDataset at ``aux_interval`` with the spec's serving-
     interval registry features forward-filled onto the aux bar grid,
     plus the spec's derived features and label recomputed at the aux
@@ -655,9 +757,9 @@ def _load_aux_interval_dataset(spec: ModelSpec, aux_interval: str) -> LoadedData
     with get_connection() as conn:
         fmc = _fetch_aux_feature_matrix(conn, spec, aux_interval=aux_interval)
         required = required_symbols_for(spec)
-        market_bundle = fetch_market_data_bundle(
+        market_bundle = _get_or_fetch_market_bundle(
             conn, required, aux_interval,
-            spec.train_start, spec.train_end,
+            spec.train_start, spec.train_end, feature_cache,
         )
     # Label (derived path only — stacked specs route here)
     y_series_full = compute_derived_label(spec.label_feature, market_bundle)
@@ -702,8 +804,8 @@ def _load_aux_interval_dataset(spec: ModelSpec, aux_interval: str) -> LoadedData
             f"All {bar_slots_total} aux bar slots dropped after NaN filter "
             f"(interval={aux_interval})."
         )
-    X_out = cleaned[feature_names_list].copy()
-    y_out = cleaned["__y__"].rename("y").copy()
+    X_out = cleaned[feature_names_list]
+    y_out = cleaned["__y__"].rename("y")
     per_feature_pct = {
         k: round(v / bar_slots_total, 4) for k, v in per_feature_non_null.items()
     }
@@ -764,7 +866,7 @@ def load_stacked_dataset(
             serving_spec = replace(spec, training_intervals=())
             piece = load_dataset(serving_spec, feature_cache=feature_cache)
         else:
-            piece = _load_aux_interval_dataset(spec, itv)
+            piece = _load_aux_interval_dataset(spec, itv, feature_cache=feature_cache)
         pieces.append((itv, piece))
 
     # Sanity: every piece should have identical feature_names (since we
@@ -820,8 +922,8 @@ def load_stacked_dataset(
         for k, v in per_feature_non_null.items()
     }
     return LoadedDataset(
-        X=X_stacked[feature_names_stacked].copy(),
-        y=y_stacked.copy(),
+        X=X_stacked[feature_names_stacked],
+        y=y_stacked,
         feature_names=tuple(feature_names_stacked),
         n_bar_slots_total=total_bar_slots,
         n_bar_slots_dropped_nan=total_dropped,

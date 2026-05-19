@@ -239,14 +239,12 @@ def _slice_by_time(
 ) -> tuple:
     """Half-open ``[start, end)`` slice of the loaded dataset by ts.
 
-    Returns ``(X_slice, y_slice)`` as copies — pandas' boolean-mask
-    indexing returns slices whose view/copy status is undefined in
-    general, and the LightGBM fit path does not mutate inputs today but
-    a future caller might. Defensive copy is cheap relative to fit time.
-    Both empty if no rows fall in range.
+    Returns ``(X_slice, y_slice)``. Boolean-mask ``.loc`` indexing
+    already returns a fresh DataFrame/Series — no extra ``.copy()``
+    needed. Both empty if no rows fall in range.
     """
     mask = (ds.X.index >= start) & (ds.X.index < end)
-    return ds.X.loc[mask].copy(), ds.y.loc[mask].copy()
+    return ds.X.loc[mask], ds.y.loc[mask]
 
 
 def _capture_oof(
