@@ -400,6 +400,45 @@ SPECS: dict[str, ModelSpec] = {
             "eth_btc_corr_24h",
         ),
     ),
+    # 2026-05-20 — first per-symbol ML spec on ETHUSDT. Built after the
+    # bar-OHLCV parametric search hit lifecycle exhaustion across
+    # BTC+ETH × {5m,15m,1h,4h}; ETH ML was previously blocked because
+    # all 10 derived features were symbols=('BTCUSDT',) only. V110
+    # migration + the matching FeatureDef edits expanded 5 features
+    # (btc_log_return_24h, btc_realized_vol_7d/30d, btc_volume_zscore_24h,
+    # label_regime_risk_on_24h) to symbols=('BTCUSDT','ETHUSDT'). The
+    # "btc_*" name prefix is now a historical scope artifact — the
+    # transformers are symbol-agnostic and the values for symbol=ETHUSDT
+    # are computed from ETH close_price / volume.
+    #
+    # This spec is the BTC-v3 twin with symbol swapped: same label
+    # (label_regime_risk_on_24h), same input set (registry features
+    # filtered by label_direction <> 'forward' and EXCLUDED_FROM_INPUTS),
+    # same hyperparams. If the regime structure is comparable between
+    # the two assets, the model should produce comparable AUC (~0.55-
+    # 0.62 range from v2/v3 history). If ETH has a structurally
+    # different regime distribution, AUC will diverge — and that's the
+    # falsifying observation. Walk-forward expected to spot it.
+    "regime_eth_v1": ModelSpec(
+        name="regime_eth_v1",
+        purpose="regime",
+        label_feature="label_regime_risk_on_24h",
+        label_version=1,
+        objective="binary",
+        symbol="ETHUSDT",
+        interval="1h",
+        train_start=_TRAIN_START,
+        train_end=_TRAIN_END,
+        # Empty — all inputs come from feature_registry rows whose
+        # symbols array contains 'ETHUSDT'. V110 expansion gives us 4
+        # input features + 1 label scoped for ETH. The cross-asset
+        # eth_btc_corr_24h is BTC-stamped only by design (V77 note)
+        # and is NOT in the ETH spec's input set — the model relies on
+        # the 4 per-bar features alone for v1. If AUC > 0.55, a v2 can
+        # add a cross-asset feature with ETH-stamped output as a
+        # follow-up FeatureDef.
+        derived_features=(),
+    ),
     # Phase 3 / M5g foundation — directional model (blueprint § 6.2).
     # Targets triple-barrier outcomes (TP-hit / SL-hit / horizon-end).
     # Used standalone by the ML_DIRECTIONAL strategy if it clears the
