@@ -180,6 +180,152 @@ def _atr(md_btc: pd.DataFrame, n: int = 14) -> pd.Series:
     return tr.rolling(n).mean()
 
 
+def _t_label_long_win_tb_loose(md: dict[str, pd.DataFrame]) -> pd.Series:
+    """Loose-threshold short-horizon label (k_tp=1.0, k_sl=0.5, horizon=6).
+    Asks 'TP at +1 ATR or SL at -0.5 ATR within 6 bars?'. More positive
+    labels => looser model => more gate-on trades.
+
+    Path C late-session: v5 with k_tp=2.0/k_sl=0.75/6-bar produced
+    POSITIVE_DELTA but gate-on n<100. v6 trades that mechanic against
+    higher conviction by lowering thresholds; expect lower-AUC model
+    but more permissive gate (more trades through).
+    """
+    horizon_bars = 6
+    k_tp = 1.0
+    k_sl = 0.5
+    atr_window = 14
+    df_btc = md["BTCUSDT"]
+    c = df_btc["close_price"].astype("float64").to_numpy()
+    h = df_btc["high_price"].astype("float64").to_numpy()
+    lo = df_btc["low_price"].astype("float64").to_numpy()
+    atr = _atr(df_btc, atr_window).to_numpy()
+    n = len(c)
+    out = np.full(n, np.nan, dtype="float64")
+    last_t = n - horizon_bars
+    if last_t <= 0:
+        return pd.Series(out, index=df_btc.index, name="label_long_win_tb_loose_v1")
+    h_win = sliding_window_view(h, horizon_bars)[1 : 1 + last_t]
+    lo_win = sliding_window_view(lo, horizon_bars)[1 : 1 + last_t]
+    entry = c[:last_t]
+    atr_v = atr[:last_t]
+    tp_lvl = entry + k_tp * atr_v
+    sl_lvl = entry - k_sl * atr_v
+    sl_hit = lo_win <= sl_lvl[:, None]
+    tp_hit = h_win >= tp_lvl[:, None]
+    sl_any = sl_hit.any(axis=1)
+    tp_any = tp_hit.any(axis=1)
+    sl_idx = np.where(sl_any, sl_hit.argmax(axis=1), horizon_bars)
+    tp_idx = np.where(tp_any, tp_hit.argmax(axis=1), horizon_bars)
+    labels = (tp_idx < sl_idx).astype("float64")
+    labels[~(np.isfinite(atr_v) & (atr_v > 0))] = np.nan
+    out[:last_t] = labels
+    return pd.Series(out, index=df_btc.index, name="label_long_win_tb_loose_v1")
+
+
+def _t_label_long_win_tb_short(md: dict[str, pd.DataFrame]) -> pd.Series:
+    """Short-horizon variant of long-win triple-barrier (6 bars instead of
+    24, k_tp=2.0 instead of 1.5, k_sl=0.75 instead of 1.0). Asks "does
+    TP at +2 ATR hit before SL at -0.75 ATR within 6 bars?" — a tighter,
+    higher-conviction entry-timing question than the 24-bar smoothed
+    label.
+
+    Authored 2026-05-21 Path C continuation: 24-bar label_long_win_tb_1h_v1
+    on directional_btc_1h_v4 produced AUC=0.5575 but paired-delta still
+    -7 pp ag90 on DCB-BTC-1h. Mechanistic hypothesis: the 24h horizon
+    matches the 24h-lookback features but not the 1h-decision cadence
+    where DCB actually opens trades. A 6h horizon + asymmetric stops
+    aligns the label's time-scope with the strategy's holding period
+    AND with the new bar-level features' lookback (4h-and-shorter).
+    """
+    horizon_bars = 6
+    k_tp = 2.0
+    k_sl = 0.75
+    atr_window = 14
+    df_btc = md["BTCUSDT"]
+    c = df_btc["close_price"].astype("float64").to_numpy()
+    h = df_btc["high_price"].astype("float64").to_numpy()
+    lo = df_btc["low_price"].astype("float64").to_numpy()
+    atr = _atr(df_btc, atr_window).to_numpy()
+    n = len(c)
+    out = np.full(n, np.nan, dtype="float64")
+    last_t = n - horizon_bars
+    if last_t <= 0:
+        return pd.Series(out, index=df_btc.index, name="label_long_win_tb_short_v1")
+    h_win = sliding_window_view(h, horizon_bars)[1 : 1 + last_t]
+    lo_win = sliding_window_view(lo, horizon_bars)[1 : 1 + last_t]
+    entry = c[:last_t]
+    atr_v = atr[:last_t]
+    tp_lvl = entry + k_tp * atr_v
+    sl_lvl = entry - k_sl * atr_v
+    sl_hit = lo_win <= sl_lvl[:, None]
+    tp_hit = h_win >= tp_lvl[:, None]
+    sl_any = sl_hit.any(axis=1)
+    tp_any = tp_hit.any(axis=1)
+    sl_idx = np.where(sl_any, sl_hit.argmax(axis=1), horizon_bars)
+    tp_idx = np.where(tp_any, tp_hit.argmax(axis=1), horizon_bars)
+    labels = (tp_idx < sl_idx).astype("float64")
+    labels[~(np.isfinite(atr_v) & (atr_v > 0))] = np.nan
+    out[:last_t] = labels
+    return pd.Series(out, index=df_btc.index, name="label_long_win_tb_short_v1")
+
+
+def _t_label_long_win_tb(md: dict[str, pd.DataFrame]) -> pd.Series:
+    """Binary triple-barrier label: 1 if TP-first within horizon for a
+    long entry at the bar, 0 otherwise (SL-first OR neutral expiry).
+
+    Same machinery as :func:`_t_label_triple_barrier` (k_tp=1.5,
+    k_sl=1.0, horizon=24 bars, atr_window=14, conservative tie rule)
+    but collapses the three-class output {-1, 0, +1} into a binary
+    "long-side wins" indicator. The orchestrator's model_registry
+    validator only accepts ``objective ∈ {binary, regression}`` — this
+    label makes the triple-barrier signal usable on the binary path.
+
+    Authored 2026-05-21 in response to three HYBRID falsifications
+    using ``label_regime_risk_on_24h`` (forward-Sharpe-sign): the
+    forward-Sharpe-sign label asks "is the next 24h on average
+    bullish?" which is a smoothed aggregate; entry gates need the
+    point-in-time question "if I enter long now, will TP hit before
+    SL?". This transformer answers exactly that.
+
+    PIT-safe: uses only future bars from t+1 onward. Same lookahead
+    boundary as the parent triple-barrier transformer; the last
+    ``horizon_bars`` rows are NaN.
+    """
+    horizon_bars = 24
+    k_tp = 1.5
+    k_sl = 1.0
+    atr_window = 14
+    df_btc = md["BTCUSDT"]
+    c = df_btc["close_price"].astype("float64").to_numpy()
+    h = df_btc["high_price"].astype("float64").to_numpy()
+    lo = df_btc["low_price"].astype("float64").to_numpy()
+    atr = _atr(df_btc, atr_window).to_numpy()
+    n = len(c)
+    out = np.full(n, np.nan, dtype="float64")
+    last_t = n - horizon_bars
+    if last_t <= 0:
+        return pd.Series(out, index=df_btc.index, name="label_long_win_tb_1h_v1")
+    h_win = sliding_window_view(h, horizon_bars)[1 : 1 + last_t]
+    lo_win = sliding_window_view(lo, horizon_bars)[1 : 1 + last_t]
+    entry = c[:last_t]
+    atr_v = atr[:last_t]
+    tp_lvl = entry + k_tp * atr_v
+    sl_lvl = entry - k_sl * atr_v
+    sl_hit = lo_win <= sl_lvl[:, None]
+    tp_hit = h_win >= tp_lvl[:, None]
+    sl_any = sl_hit.any(axis=1)
+    tp_any = tp_hit.any(axis=1)
+    sl_idx = np.where(sl_any, sl_hit.argmax(axis=1), horizon_bars)
+    tp_idx = np.where(tp_any, tp_hit.argmax(axis=1), horizon_bars)
+    # Long-win = TP hit STRICTLY before SL (intra-bar tie goes to SL,
+    # matching the parent transformer's conservative rule).
+    labels = (tp_idx < sl_idx).astype("float64")
+    # ATR-invalid rows become NaN so the loader drops them.
+    labels[~(np.isfinite(atr_v) & (atr_v > 0))] = np.nan
+    out[:last_t] = labels
+    return pd.Series(out, index=df_btc.index, name="label_long_win_tb_1h_v1")
+
+
 def _t_label_triple_barrier(md: dict[str, pd.DataFrame]) -> pd.Series:
     """López de Prado triple-barrier labeler, ported from
     ``blackheart_ingest.features.definitions._forward_triple_barrier``.
@@ -301,6 +447,41 @@ DERIVED_LABELS: dict[str, DerivedFeature] = {
         family="label",
         required_symbols=("BTCUSDT",),
         transformer=_t_label_triple_barrier,
+        pit_safe=False,
+    ),
+    # 2026-05-21: binary long-win triple-barrier label. Resolves the
+    # label-misalignment failure mode documented in journal entries
+    # c936710c (DCB-BTC), c34ceb35 (MMR-BTC), 3a4451f4 (DCB-ETH) where
+    # forward-Sharpe-sign smoothed-aggregate predictions destroyed value
+    # as an entry gate. Computed in-train; not in feature_registry so
+    # the loader picks this derived path automatically.
+    "label_long_win_tb_1h_v1": DerivedFeature(
+        name="label_long_win_tb_1h_v1",
+        family="label",
+        required_symbols=("BTCUSDT",),
+        transformer=_t_label_long_win_tb,
+        pit_safe=False,
+    ),
+    # 2026-05-21 Path C continuation: short-horizon (6-bar) triple-barrier
+    # binary label with asymmetric stops (k_tp=2.0, k_sl=0.75). Aligns
+    # label time-scope with strategy holding period and bar-level features'
+    # lookbacks. Consumed by directional_btc_1h_v5.
+    "label_long_win_tb_short_v1": DerivedFeature(
+        name="label_long_win_tb_short_v1",
+        family="label",
+        required_symbols=("BTCUSDT",),
+        transformer=_t_label_long_win_tb_short,
+        pit_safe=False,
+    ),
+    # 2026-05-21 Path C late: loose-threshold variant of short-horizon
+    # label. k_tp=1.0, k_sl=0.5, horizon=6. Tests whether a less-
+    # discriminating model produces a less-restrictive gate (more
+    # gate-on trades through, clearing V11 n>=100).
+    "label_long_win_tb_loose_v1": DerivedFeature(
+        name="label_long_win_tb_loose_v1",
+        family="label",
+        required_symbols=("BTCUSDT",),
+        transformer=_t_label_long_win_tb_loose,
         pit_safe=False,
     ),
 }

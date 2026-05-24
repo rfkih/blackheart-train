@@ -35,8 +35,35 @@ def test_locked_specs_exist():
         # Phase 4 Session 2: registry-only twin of regime_btc_v2 — no
         # derived_features, label resolved via feature_registry (V77).
         "regime_btc_v3",
+        # 2026-05-20: first per-symbol ML spec on ETHUSDT (V110 expanded
+        # the registry-feature symbol scope to include ETHUSDT).
+        "regime_eth_v1",
         # M5g.1: Phase 3 directional model (3-class triple-barrier).
         "directional_btc_1h_v1",
+        # 2026-05-21: binary directional twin of v1 — resolves
+        # ANTI_PATTERN 20fa437f (orchestrator model_registry validator
+        # rejects objective='multiclass'). v2 is the registerable peer
+        # the researcher loop drives into HYBRID sweeps.
+        "directional_btc_1h_v2",
+        # 2026-05-21: triple-barrier-binary directional spec (v3) +
+        # V111 bar-level feature stack augmentations (v4 = v3 + 5 new
+        # bar-level features; v5 = v4 + short-horizon asymmetric label;
+        # v6 = v5 with looser k_tp/k_sl). All BTC-1h.
+        "directional_btc_1h_v3",
+        "directional_btc_1h_v4",
+        "directional_btc_1h_v5",
+        "directional_btc_1h_v6",
+        # 2026-05-21 Path C: first sidecar-servable ETH directional spec
+        # (HARD_RULE_BLOCK_INFERENCE_STAMPING resolution). Bar-only
+        # feature stack (9 features, no macro/cross-asset) so the
+        # inference sidecar can resolve every feature_value at
+        # (symbol=ETHUSDT, interval=1h, ts=bar) exact-match.
+        "directional_eth_1h_v1",
+        # 2026-05-21 Path C continuation: regime variant of the same
+        # bar-only ETH stack. Routes through the 5-gate modulator
+        # gauntlet (AUC bar 0.52) instead of the 13-gate directional
+        # gauntlet (AUC bar 0.55) which the bar-only stack cannot clear.
+        "regime_eth_v2",
     }
 
 

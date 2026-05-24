@@ -104,11 +104,15 @@ class LoadedDataset:
 # ── Registry queries ─────────────────────────────────────────────────────────
 
 
-def _list_input_features(conn: psycopg.Connection) -> list[dict[str, Any]]:
+def _list_input_features(
+    conn: psycopg.Connection,
+    extra_excluded: tuple[str, ...] | frozenset[str] = (),
+) -> list[dict[str, Any]]:
     """Return all registered features that are eligible inputs.
 
     Eligible = ``status='registered'`` AND not in
-    :data:`EXCLUDED_FROM_INPUTS` AND ``label_direction <> 'forward'``.
+    :data:`EXCLUDED_FROM_INPUTS` AND not in ``extra_excluded`` AND
+    ``label_direction <> 'forward'``.
 
     Two filters with non-overlapping responsibilities:
 
@@ -124,7 +128,15 @@ def _list_input_features(conn: psycopg.Connection) -> list[dict[str, Any]]:
       this set no longer contains labels — schema-based filter is
       sufficient. See :data:`EXCLUDED_FROM_INPUTS` for the residual
       entries and their motivation.
+    * ``extra_excluded`` is the spec-scoped exclusion (2026-05-21 Path C).
+      Used by directional_eth_1h_v1 to opt out of macro features
+      (fear_greed_value, stablecoin_supply_*, eth_btc_ratio_*) so the
+      trained artifact's feature_set stays sidecar-servable — those
+      features are persisted at symbol='', interval='' (daily global
+      cadence) which blackheart-inference's exact-match
+      fetch_per_bar_values_at_ts cannot resolve at bar-cadence ts.
     """
+    combined_excluded = list(set(EXCLUDED_FROM_INPUTS) | set(extra_excluded))
     sql = """
         SELECT feature_name, version, family, max_ffill_age_hours,
                symbols, intervals, ffill_policy
@@ -135,7 +147,7 @@ def _list_input_features(conn: psycopg.Connection) -> list[dict[str, Any]]:
         ORDER BY feature_name, version
     """
     with conn.cursor() as cur:
-        cur.execute(sql, {"excluded": list(EXCLUDED_FROM_INPUTS)})
+        cur.execute(sql, {"excluded": combined_excluded})
         return list(cur.fetchall())
 
 
@@ -351,7 +363,7 @@ def _fetch_feature_matrix(conn: psycopg.Connection, spec: ModelSpec) -> _Feature
 
     DB cost: two round-trips (per-bar + global) regardless of feature count.
     """
-    inputs_meta = _list_input_features(conn)
+    inputs_meta = _list_input_features(conn, spec.extra_excluded_features)
     bar_index = _bar_grid(spec.train_start, spec.train_end, spec.interval)
 
     per_bar_metas: list[dict[str, Any]] = []
@@ -648,7 +660,7 @@ def _fetch_aux_feature_matrix(
 
     DB cost: two round-trips (per-bar + global) regardless of feature count.
     """
-    inputs_meta = _list_input_features(conn)
+    inputs_meta = _list_input_features(conn, spec.extra_excluded_features)
     bar_index = _bar_grid(spec.train_start, spec.train_end, aux_interval)
 
     per_bar_metas: list[dict[str, Any]] = []
