@@ -582,6 +582,44 @@ SPECS: dict[str, ModelSpec] = {
         train_end=_TRAIN_END,
         derived_features=(),
     ),
+    # 2026-05-27: first SOLUSDT ML regime spec. Mirrors regime_eth_v2 with
+    # three differences: symbol=SOLUSDT, interval=4h, train_start=2024-01-01.
+    #
+    # Background: DCB-SOLUSDT-4h is the highest-EV candidate from the SOLUSDT
+    # archetype sweep (ag90=30.36%/yr, n=148) but blocked by PF CI [0.867,1.921]
+    # spanning 1.0 and DSR=0.822. The regime gate on DCB-ETH-1h x regime_eth_v2
+    # narrowed variance and produced the 4th strategy graduation (ag90=+94.99%/yr
+    # ROBUST) -- same mechanism expected here.
+    #
+    # Features: 9 registry per-bar features (btc_log_return_1h/_4h/_24h,
+    # btc_realized_vol_7d/_30d, btc_rsi_14_1h, btc_atr_ratio_14_24,
+    # btc_volume_zscore_24h/_4h) now available for SOLUSDT x 4h via V123
+    # migration + compute_features run (52,060 rows).
+    #
+    # Label: label_regime_risk_on_24h at 4h cadence -- horizon_bars=24 covers
+    # 96h forward Sharpe (4-day regime). Class balance: 49.4%/50.6%.
+    #
+    # Train window: 2024-01-01 to 2026-05-14 (full 2-year SOL history;
+    # NOT _TRAIN_START=2024-12-01 which would waste 11 months of SOL data).
+    # Walk-forward needs ~3,200 bars for 6 folds; we have ~5,214 -- adequate.
+    "regime_sol_v1": ModelSpec(
+        name="regime_sol_v1",
+        purpose="regime",
+        label_feature="label_regime_risk_on_24h",
+        label_version=1,
+        objective="binary",
+        symbol="SOLUSDT",
+        interval="4h",
+        train_start=datetime(2024, 1, 1),
+        train_end=_TRAIN_END,
+        derived_features=(),
+        extra_excluded_features=(
+            "fear_greed_value",
+            "stablecoin_supply_change_7d",
+            "stablecoin_supply_change_30d",
+            "eth_btc_ratio_momentum_20d",
+        ),
+    ),
     # 2026-05-21 Path C continuation — sidecar-servable ETH regime spec.
     # Direct response to directional_eth_1h_v1's 13-gate gauntlet FAIL
     # (walk-forward AUC mean 0.534-0.538 across 3 hyperparam variants,
@@ -742,6 +780,243 @@ SPECS: dict[str, ModelSpec] = {
         training_intervals=("1h", "15m"),
         # M5g.7: per-fold correlation + MI feature selection.
         feature_selection_enabled=True,
+    ),
+    # 2026-05-27: Funding-rate regime detector — orthogonal to price-action.
+    # Mechanism hypothesis: BTC 8h funding rate encodes levered-market
+    # crowding. Persistently positive = longs crowded (squeeze-vulnerable);
+    # persistently negative = shorts crowded. The sign_streak and
+    # percentile_30d features capture PERSISTENCE and RELATIVE ELEVATION
+    # of funding, which price-action features cannot see.
+    #
+    # Feature set: btc_funding_8h, btc_funding_zscore_30d,
+    # btc_funding_sign_streak, btc_funding_percentile_30d (V121).
+    # All 4 are global (symbol='', interval='') in feature_values and are
+    # forward-filled onto the 1h bar grid by the loader. ALL other registry
+    # features are excluded via extra_excluded_features to keep the
+    # funding signal isolated. If this model shows AUC > 0.55 in
+    # walk-forward, it is genuinely orthogonal to regime_btc_v3 and can
+    # be tested as a second modulator in the HYBRID strategy.
+    #
+    # purpose="positioning" routes through the 5-gate modulator gauntlet
+    # (same as regime_*); the label is label_regime_risk_on_24h (binary
+    # forward-Sharpe-sign, same as regime_btc_v3) so results are directly
+    # comparable. The feature set is the only variable changing vs v3.
+    "funding_regime_v1": ModelSpec(
+        name="funding_regime_v1",
+        purpose="positioning",
+        label_feature="label_regime_risk_on_24h",
+        label_version=1,
+        objective="binary",
+        symbol="BTCUSDT",
+        interval="1h",
+        train_start=_TRAIN_START,
+        train_end=_TRAIN_END,
+        derived_features=(),
+        extra_excluded_features=(
+            # Technical / price-action per-bar features (BTCUSDT 1h)
+            "btc_log_return_1h",
+            "btc_log_return_4h",
+            "btc_log_return_24h",
+            "btc_realized_vol_7d",
+            "btc_realized_vol_30d",
+            "btc_volume_zscore_24h",
+            "btc_volume_zscore_4h",
+            "btc_rsi_14_1h",
+            "btc_atr_ratio_14_24",
+            # Cross-asset (per-bar, BTCUSDT 1h)
+            "eth_btc_corr_24h",
+            # Global macro (FRED, daily)
+            "vix_close",
+            "dxy_close",
+            "dxy_zscore_30d",
+            "real_yield_10y_level",
+            "real_yield_10y_change_20d",
+            "dxy_zscore_252d",
+            "dxy_momentum_20d",
+            "vix_percentile_252d",
+            "term_spread_2s10s",
+            # Global flow / market_structure / sentiment
+            "stablecoin_supply_change_7d",
+            "stablecoin_supply_change_30d",
+            "btc_dominance_change_7d",
+            "eth_btc_ratio_momentum_20d",
+            "fear_greed_value",
+        ),
+    ),
+    # 2026-05-27: funding features with the CORRECT label.
+    # funding_regime_v1 failed (AUC=0.50) because label_regime_risk_on_24h
+    # is a price-action label — funding features cannot predict price
+    # direction. This spec keeps the identical 4-feature funding set but
+    # changes the label to label_long_win_tb_1h_v1, which asks "if I enter
+    # long here, does TP hit before SL in 24 bars?" — a question funding
+    # context can plausibly inform (crowded longs = elevated SL risk,
+    # so the model should learn to suppress long entries when funding is
+    # high). purpose="directional" routes through the 13-gate gauntlet.
+    "funding_entry_v1": ModelSpec(
+        name="funding_entry_v1",
+        purpose="directional",
+        label_feature="label_long_win_tb_1h_v1",
+        label_version=1,
+        objective="binary",
+        symbol="BTCUSDT",
+        interval="1h",
+        train_start=_TRAIN_START,
+        train_end=_TRAIN_END,
+        derived_features=(),
+        extra_excluded_features=(
+            # Technical / price-action per-bar features (BTCUSDT 1h)
+            "btc_log_return_1h",
+            "btc_log_return_4h",
+            "btc_log_return_24h",
+            "btc_realized_vol_7d",
+            "btc_realized_vol_30d",
+            "btc_volume_zscore_24h",
+            "btc_volume_zscore_4h",
+            "btc_rsi_14_1h",
+            "btc_atr_ratio_14_24",
+            # Cross-asset (per-bar, BTCUSDT 1h)
+            "eth_btc_corr_24h",
+            # Global macro (FRED, daily)
+            "vix_close",
+            "dxy_close",
+            "dxy_zscore_30d",
+            "real_yield_10y_level",
+            "real_yield_10y_change_20d",
+            "dxy_zscore_252d",
+            "dxy_momentum_20d",
+            "vix_percentile_252d",
+            "term_spread_2s10s",
+            # Global flow / market_structure / sentiment
+            "stablecoin_supply_change_7d",
+            "stablecoin_supply_change_30d",
+            "btc_dominance_change_7d",
+            "eth_btc_ratio_momentum_20d",
+            "fear_greed_value",
+        ),
+    ),
+    # 2026-05-27: combined bar-level + funding features with the TB label.
+    # directional_btc_1h_v4 used only bar-level features (RSI, ATR ratio,
+    # log returns, volume) and still produced negative paired-delta despite
+    # the correct label (label_long_win_tb_1h_v1). Hypothesis: bar-level
+    # momentum alone isn't sufficient to predict entry quality — funding
+    # context encodes levered-market crowding that momentum cannot see.
+    # This spec adds the V121 funding features (btc_funding_8h,
+    # btc_funding_zscore_30d, btc_funding_sign_streak,
+    # btc_funding_percentile_30d) to v4's bar-level stack. Macro and
+    # sentiment features are excluded to limit covariate-shift noise
+    # and keep the feature set servable-in-principle by the sidecar once
+    # funding features are promoted to per-bar cadence.
+    "directional_btc_1h_v7": ModelSpec(
+        name="directional_btc_1h_v7",
+        purpose="directional",
+        label_feature="label_long_win_tb_1h_v1",
+        label_version=1,
+        objective="binary",
+        symbol="BTCUSDT",
+        interval="1h",
+        train_start=_TRAIN_START,
+        train_end=_TRAIN_END,
+        derived_features=(),
+        # Exclude macro (FRED/daily) and sentiment features. Keep bar-level
+        # BTCUSDT 1h features AND the V121 funding features (global cadence).
+        extra_excluded_features=(
+            "vix_close",
+            "dxy_close",
+            "dxy_zscore_30d",
+            "real_yield_10y_level",
+            "real_yield_10y_change_20d",
+            "dxy_zscore_252d",
+            "dxy_momentum_20d",
+            "vix_percentile_252d",
+            "term_spread_2s10s",
+            "stablecoin_supply_change_7d",
+            "stablecoin_supply_change_30d",
+            "btc_dominance_change_7d",
+            "eth_btc_ratio_momentum_20d",
+            "fear_greed_value",
+        ),
+    ),
+    # 2026-05-27: funding-crowding → squeeze hypothesis, SHORT side.
+    # funding_entry_v1 tests whether funding predicts LONG entry quality.
+    # This spec tests the other direction: persistently positive funding
+    # → longs crowded → squeeze imminent → SHORT entries win. Uses the
+    # new label_short_win_tb_1h_v1 (mirror of the long-win label with
+    # inverted barriers). Same isolated 4-feature funding set as
+    # funding_regime_v1 / funding_entry_v1.
+    "funding_short_v1": ModelSpec(
+        name="funding_short_v1",
+        purpose="directional",
+        label_feature="label_short_win_tb_1h_v1",
+        label_version=1,
+        objective="binary",
+        symbol="BTCUSDT",
+        interval="1h",
+        train_start=_TRAIN_START,
+        train_end=_TRAIN_END,
+        derived_features=(),
+        extra_excluded_features=(
+            "btc_log_return_1h",
+            "btc_log_return_4h",
+            "btc_log_return_24h",
+            "btc_realized_vol_7d",
+            "btc_realized_vol_30d",
+            "btc_volume_zscore_24h",
+            "btc_volume_zscore_4h",
+            "btc_rsi_14_1h",
+            "btc_atr_ratio_14_24",
+            "eth_btc_corr_24h",
+            "vix_close",
+            "dxy_close",
+            "dxy_zscore_30d",
+            "real_yield_10y_level",
+            "real_yield_10y_change_20d",
+            "dxy_zscore_252d",
+            "dxy_momentum_20d",
+            "vix_percentile_252d",
+            "term_spread_2s10s",
+            "stablecoin_supply_change_7d",
+            "stablecoin_supply_change_30d",
+            "btc_dominance_change_7d",
+            "eth_btc_ratio_momentum_20d",
+            "fear_greed_value",
+        ),
+    ),
+    # 2026-05-31 — VBO HYBRID gate candidates.
+    # regime_btc_v3 was retired; VBO_RESEARCH BTCUSDT HYBRID needs a fresh
+    # BTC regime signal. regime_vbo_btc_v1 is a clean re-train of the v3
+    # architecture under a new signal name so its lifecycle is independent
+    # of the retired model.
+    "regime_vbo_btc_v1": ModelSpec(
+        name="regime_vbo_btc_v1",
+        purpose="regime",
+        label_feature="label_regime_risk_on_24h",
+        label_version=1,
+        objective="binary",
+        symbol="BTCUSDT",
+        interval="1h",
+        train_start=_TRAIN_START,
+        train_end=_TRAIN_END,
+        derived_features=(),
+    ),
+    # ETH variant — allows VBO_RESEARCH ETHUSDT HYBRID sweeps to gate on
+    # an ETH-specific regime signal independent of regime_eth_v2's lifecycle.
+    "regime_vbo_eth_v1": ModelSpec(
+        name="regime_vbo_eth_v1",
+        purpose="regime",
+        label_feature="label_regime_risk_on_24h",
+        label_version=1,
+        objective="binary",
+        symbol="ETHUSDT",
+        interval="1h",
+        train_start=_TRAIN_START,
+        train_end=_TRAIN_END,
+        derived_features=(),
+        extra_excluded_features=(
+            "fear_greed_value",
+            "stablecoin_supply_change_7d",
+            "stablecoin_supply_change_30d",
+            "eth_btc_ratio_momentum_20d",
+        ),
     ),
 }
 
