@@ -998,6 +998,28 @@ SPECS: dict[str, ModelSpec] = {
         train_end=_TRAIN_END,
         derived_features=(),
     ),
+    # v2 — excludes the 4 macro/global features (fear_greed, stablecoin,
+    # eth_btc_ratio) that caused only 1 of 6 walk-forward folds to complete
+    # in v1 (sparse global rows in some fold windows). Same exclusion set as
+    # regime_vbo_eth_v1 so all 6 folds run successfully.
+    "regime_vbo_btc_v2": ModelSpec(
+        name="regime_vbo_btc_v2",
+        purpose="regime",
+        label_feature="label_regime_risk_on_24h",
+        label_version=1,
+        objective="binary",
+        symbol="BTCUSDT",
+        interval="1h",
+        train_start=_TRAIN_START,
+        train_end=_TRAIN_END,
+        derived_features=(),
+        extra_excluded_features=(
+            "fear_greed_value",
+            "stablecoin_supply_change_7d",
+            "stablecoin_supply_change_30d",
+            "eth_btc_ratio_momentum_20d",
+        ),
+    ),
     # ETH variant — allows VBO_RESEARCH ETHUSDT HYBRID sweeps to gate on
     # an ETH-specific regime signal independent of regime_eth_v2's lifecycle.
     "regime_vbo_eth_v1": ModelSpec(
