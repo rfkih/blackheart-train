@@ -64,6 +64,22 @@ def test_locked_specs_exist():
         # gauntlet (AUC bar 0.52) instead of the 13-gate directional
         # gauntlet (AUC bar 0.55) which the bar-only stack cannot clear.
         "regime_eth_v2",
+        # 2026-05-27: ML audit fixes — new specs for funding-driven hypotheses.
+        # funding_regime_v1 kept for registry continuity (label fixed in v2).
+        "funding_regime_v1",
+        "regime_sol_v1",
+        # funding_entry_v1: same 4 funding features as funding_regime_v1 but
+        # with the correct label (label_long_win_tb_1h_v1 instead of the
+        # wrong price-action regime label).
+        "funding_entry_v1",
+        # directional_btc_1h_v7: bar-level + V121 funding features, excludes
+        # macro/sentiment (sidecar-servable). Tests whether funding context
+        # improves entry-quality prediction.
+        "directional_btc_1h_v7",
+        # funding_short_v1: funding features × label_short_win_tb_1h_v1 —
+        # tests the crowding→squeeze hypothesis (high funding → longs crowded
+        # → short entries win).
+        "funding_short_v1",
     }
 
 

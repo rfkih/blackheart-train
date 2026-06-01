@@ -269,6 +269,60 @@ def _t_label_long_win_tb_short(md: dict[str, pd.DataFrame]) -> pd.Series:
     return pd.Series(out, index=df_btc.index, name="label_long_win_tb_short_v1")
 
 
+def _t_label_short_win_tb(md: dict[str, pd.DataFrame]) -> pd.Series:
+    """Binary triple-barrier label for SHORT entries: 1 if TP-first within
+    horizon for a short entry at the bar, 0 otherwise.
+
+    Mirror of _t_label_long_win_tb with inverted barrier levels:
+      TP = entry - k_tp * ATR  (price falls to this level)
+      SL = entry + k_sl * ATR  (price rises to this level)
+    TP-hit checks the LOW series; SL-hit checks the HIGH series.
+
+    Same params as the long-win label (k_tp=1.5, k_sl=1.0, horizon=24,
+    atr_window=14) so results are directly comparable.
+
+    Motivation: the funding-crowding hypothesis. When BTC 8h funding is
+    persistently positive, longs are crowded and squeeze risk is elevated
+    — implying short entries have elevated TP probability. Training funding
+    features on label_long_win_tb_1h_v1 (a LONG win label) is the wrong
+    direction. This label lets the model answer the correct question.
+    """
+    horizon_bars = 24
+    k_tp = 1.5
+    k_sl = 1.0
+    atr_window = 14
+    df_btc = md["BTCUSDT"]
+    c = df_btc["close_price"].astype("float64").to_numpy()
+    h = df_btc["high_price"].astype("float64").to_numpy()
+    lo = df_btc["low_price"].astype("float64").to_numpy()
+    atr = _atr(df_btc, atr_window).to_numpy()
+    n = len(c)
+    out = np.full(n, np.nan, dtype="float64")
+    last_t = n - horizon_bars
+    if last_t <= 0:
+        return pd.Series(out, index=df_btc.index, name="label_short_win_tb_1h_v1")
+    h_win = sliding_window_view(h, horizon_bars)[1 : 1 + last_t]
+    lo_win = sliding_window_view(lo, horizon_bars)[1 : 1 + last_t]
+    entry = c[:last_t]
+    atr_v = atr[:last_t]
+    # Short: TP is below entry (price falls), SL is above entry (price rises).
+    tp_lvl = entry - k_tp * atr_v
+    sl_lvl = entry + k_sl * atr_v
+    # TP hit when LOW drops to or below the TP level.
+    tp_hit = lo_win <= tp_lvl[:, None]
+    # SL hit when HIGH rises to or above the SL level.
+    sl_hit = h_win >= sl_lvl[:, None]
+    sl_any = sl_hit.any(axis=1)
+    tp_any = tp_hit.any(axis=1)
+    sl_idx = np.where(sl_any, sl_hit.argmax(axis=1), horizon_bars)
+    tp_idx = np.where(tp_any, tp_hit.argmax(axis=1), horizon_bars)
+    # Short-win = TP hit STRICTLY before SL (tie goes to SL, conservative).
+    labels = (tp_idx < sl_idx).astype("float64")
+    labels[~(np.isfinite(atr_v) & (atr_v > 0))] = np.nan
+    out[:last_t] = labels
+    return pd.Series(out, index=df_btc.index, name="label_short_win_tb_1h_v1")
+
+
 def _t_label_long_win_tb(md: dict[str, pd.DataFrame]) -> pd.Series:
     """Binary triple-barrier label: 1 if TP-first within horizon for a
     long entry at the bar, 0 otherwise (SL-first OR neutral expiry).
@@ -482,6 +536,20 @@ DERIVED_LABELS: dict[str, DerivedFeature] = {
         family="label",
         required_symbols=("BTCUSDT",),
         transformer=_t_label_long_win_tb_loose,
+        pit_safe=False,
+    ),
+    # 2026-05-27: short-entry mirror of label_long_win_tb_1h_v1.
+    # Same params (k_tp=1.5, k_sl=1.0, horizon=24) but barrier levels
+    # are inverted: TP below entry (LOW must drop), SL above entry (HIGH
+    # must rise). Needed for the funding-crowding → squeeze hypothesis:
+    # funding features predict crowded-long → squeeze → SHORT wins, not
+    # LONG wins. Training on label_long_win_tb_1h_v1 was the wrong
+    # direction. Consumed by funding_short_v1.
+    "label_short_win_tb_1h_v1": DerivedFeature(
+        name="label_short_win_tb_1h_v1",
+        family="label",
+        required_symbols=("BTCUSDT",),
+        transformer=_t_label_short_win_tb,
         pit_safe=False,
     ),
 }

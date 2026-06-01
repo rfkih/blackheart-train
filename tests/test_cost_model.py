@@ -64,11 +64,12 @@ def test_short_trade_wins_K_SL_atr_units_on_SL_long_hit():
     assert _per_trade_atr_units(0, 0) == +K_SL
 
 
-def test_short_trade_loses_K_TP_atr_units_on_TP_long_hit():
-    """predicted=0 (short), actual=2 (price up to TP_long) →
-    -K_TP ATR units (short loses; asymmetric — losses bigger than wins
-    for shorts because of long-biased label construction)."""
-    assert _per_trade_atr_units(0, 2) == -K_TP
+def test_short_trade_loses_K_SL_atr_units_on_TP_long_hit():
+    """predicted=0 (short), actual=2 (price rose to TP_long at +K_TP ATR) →
+    -K_SL ATR units.  The short's SL sits at +K_SL ATR < K_TP ATR, so the
+    short is stopped out at K_SL before the LONG TP is hit.  MC1 fix:
+    original formula incorrectly used -K_TP here."""
+    assert _per_trade_atr_units(0, 2) == -K_SL
 
 
 def test_no_trade_when_predicted_horizon_end():

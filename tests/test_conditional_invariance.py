@@ -173,14 +173,71 @@ def test_per_feature_max_diff_populated():
     assert r.per_feature_max_diff["b"] > r.per_feature_max_diff["a"]
 
 
+# ── Multiclass ────────────────────────────────────────────────────────────
+
+
+def test_multiclass_stable_distributions_pass():
+    """3-class labels with identical class proportions in each bin → low
+    max_abs_diff, should pass the 0.15 threshold."""
+    rng = np.random.default_rng(7)
+    n = 2000
+    x = rng.standard_normal(n)
+    # y: 3 balanced classes, label is independent of x (no shift possible).
+    y = rng.integers(0, 3, size=n)
+    X_tr = pd.DataFrame({"x": x[:n // 2]})
+    X_te = pd.DataFrame({"x": x[n // 2:]})
+    y_tr = pd.Series(y[:n // 2])
+    y_te = pd.Series(y[n // 2:])
+    r = conditional_invariance(X_tr, y_tr, X_te, y_te, objective="multiclass")
+    assert r.skipped_reason is None
+    assert r.n_pairs_evaluated > 0
+    # With balanced classes and no feature-label relationship, max_abs_diff
+    # should be well below the 0.15 threshold (expected ~binomial noise).
+    assert r.max_abs_diff < 0.15
+
+
+def test_multiclass_large_shift_detected():
+    """A feature whose low-bin has class 0 dominant in train but class 2
+    dominant in test should produce a large max_abs_diff."""
+    n = 1000
+    x = np.linspace(-3, 3, n)
+    # Train: low x → mostly class 0; mid → class 1; high → class 2.
+    y_tr = np.where(x < -1, 0, np.where(x < 1, 1, 2))
+    # Test: REVERSED — low x → mostly class 2, high → class 0.
+    y_te = np.where(x < -1, 2, np.where(x < 1, 1, 0))
+    X_tr = pd.DataFrame({"x": x})
+    X_te = pd.DataFrame({"x": x})
+    r = conditional_invariance(
+        X_tr, pd.Series(y_tr.astype(float)), X_te, pd.Series(y_te.astype(float)),
+        objective="multiclass", min_bin_samples=10,
+    )
+    assert r.skipped_reason is None
+    # With completely reversed class order, the per-class shift per bin
+    # should be very large (near 1.0 for the dominant classes).
+    assert r.max_abs_diff > 0.50
+
+
+def test_multiclass_objective_accepted():
+    """objective='multiclass' must not raise ValueError."""
+    rng = np.random.default_rng(42)
+    n = 200
+    X_tr = pd.DataFrame({"a": rng.standard_normal(n)})
+    X_te = pd.DataFrame({"a": rng.standard_normal(n)})
+    y_tr = pd.Series(rng.integers(0, 3, size=n).astype(float))
+    y_te = pd.Series(rng.integers(0, 3, size=n).astype(float))
+    r = conditional_invariance(X_tr, y_tr, X_te, y_te, objective="multiclass")
+    assert isinstance(r.max_abs_diff, float)
+
+
 # ── Pass threshold table ───────────────────────────────────────────────────
 
 
 def test_pass_thresholds_exist_for_supported_objectives():
     assert "binary" in PASS_THRESHOLD
     assert "regression" in PASS_THRESHOLD
-    # Multiclass deliberately omitted; gauntlet treats as SKIP.
-    assert "multiclass" not in PASS_THRESHOLD
+    # Multiclass: per-class P(y=k|bin) shift — same 0.15 bound as binary.
+    assert "multiclass" in PASS_THRESHOLD
+    assert PASS_THRESHOLD["multiclass"] == 0.15
 
 
 def test_defaults():

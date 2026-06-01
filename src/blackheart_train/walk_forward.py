@@ -83,6 +83,29 @@ DEFAULT_TRAIN_DAYS = 365
 DEFAULT_TEST_DAYS = 21
 DEFAULT_EMBARGO_DAYS = 7
 DEFAULT_N_FOLDS = 6
+# Reduce to 14 days to unlock ~10 folds on 17-month datasets without
+# extending the training window. Uncomment on the CLI call when you
+# need more OOF evaluation coverage (lower statistical noise on gauntlet
+# verdicts); keep 21 for registered models to preserve comparability.
+_FINE_TEST_DAYS = 14
+
+# Minimum embargo required per label, in calendar days. embargo_days
+# must cover at least the label's forward-lookahead window to prevent
+# train/test label leakage at fold boundaries. 7 days is safe for all
+# current 24-bar × 1h = 24h labels; 168-bar labels (label_return_7d)
+# require ≥7 days (exactly at the edge — use ≥8 if in doubt).
+_LABEL_MIN_EMBARGO_DAYS: dict[str, int] = {
+    "label_return_7d": 7,
+    "label_return_24h": 1,
+    "label_meanrev_24h": 1,
+    "label_regime_risk_on_48h": 2,
+    "label_regime_risk_on_24h": 1,
+    "label_triple_barrier": 1,
+    "label_long_win_tb_1h_v1": 1,
+    "label_long_win_tb_short_v1": 1,
+    "label_long_win_tb_loose_v1": 1,
+    "label_short_win_tb_1h_v1": 1,
+}
 
 
 # ── Errors ─────────────────────────────────────────────────────────────────
@@ -146,6 +169,10 @@ class FoldMetrics:
     features_selected: list[str] = field(default_factory=list)
     oof_predictions: list[Any] = field(default_factory=list)
     oof_timestamps: list[datetime] = field(default_factory=list)
+    # Top-10 LightGBM gain importances for this fold's booster.
+    # Keyed by feature name; value is the raw gain (not normalised).
+    # Empty when the estimator type doesn't expose feature_importance().
+    feature_importances: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -163,6 +190,19 @@ class WalkForwardResult:
     primary_median: float
     primary_std: float
     metric_means: dict[str, float]   # mean per metric across valid folds
+    # Slope of primary-metric values across fold indices (OLS, 1 unit = 1 fold).
+    # Negative slope means the metric is declining over time — a signal that
+    # the model's edge may be decaying. NaN when < 2 valid folds.
+    primary_fold_trend_slope: float = field(default=float("nan"))
+    # Best fold by primary metric and its value — diagnostic, not used for
+    # model selection (last-fold semantics are preserved for production).
+    best_fold_k: int | None = field(default=None)
+    best_primary_value: float | None = field(default=None)
+    # True when filter_eval_to_serving_interval was active for this spec:
+    # the model trains on all intervals but eval (and serving) use only
+    # the spec's target interval. CI runs on full X_tr vs filtered X_te,
+    # so conditional-invariance is measured across distributions.
+    train_serve_filter_active: bool = field(default=False)
     folds: list[FoldMetrics] = field(default_factory=list)
     # Estimator from the most recent valid fold — a ``lgb.Booster`` for
     # single-model specs, or an ``ensemble.Ensemble`` for multi-model
@@ -286,6 +326,39 @@ def _capture_oof(
     return [], []
 
 
+def _capture_feature_importances(booster: Any, top_n: int = 10) -> dict[str, float]:
+    """Extract per-feature gain importances from a booster or ensemble.
+
+    For an lgb.Booster: calls ``.feature_importance(importance_type='gain')``.
+    For an Ensemble: averages gain importances across sub-models.
+    Returns an empty dict when the estimator type doesn't expose importances
+    (diagnostic only — never blocks training).
+    """
+    try:
+        if hasattr(booster, "feature_importance") and not hasattr(booster, "models"):
+            imps = booster.feature_importance(importance_type="gain")
+            fnames = booster.feature_name()
+            pairs = sorted(zip(fnames, imps.tolist()), key=lambda x: -x[1])
+            return {k: round(float(v), 2) for k, v in pairs[:top_n]}
+        if hasattr(booster, "models"):
+            accum: dict[str, float] = {}
+            n_sub = 0
+            for m in booster.models:
+                if hasattr(m, "feature_importance"):
+                    imps = m.feature_importance(importance_type="gain")
+                    fnames = m.feature_name()
+                    for f, v in zip(fnames, imps.tolist()):
+                        accum[f] = accum.get(f, 0.0) + float(v)
+                    n_sub += 1
+            if n_sub > 0:
+                avg = {f: round(v / n_sub, 2) for f, v in accum.items()}
+                pairs = sorted(avg.items(), key=lambda x: -x[1])
+                return dict(pairs[:top_n])
+    except Exception:
+        pass
+    return {}
+
+
 def run_walk_forward(
     ds: LoadedDataset,
     spec: ModelSpec,
@@ -346,6 +419,12 @@ def run_walk_forward(
     fold_results: list[FoldMetrics] = []
     n_runs = 0
     last_booster: Any = None
+    best_booster_metric: float = float("-inf")
+    best_fold_k: int | None = None
+    best_primary_value: float | None = None
+    # True when the spec uses interval filtering (stacked-interval training
+    # but serving-interval eval). Set on first encounter; constant for spec.
+    train_serve_filter_active = bool(spec.training_intervals)
 
     for fold in folds:
         X_tr, y_tr = _slice_by_time(ds, fold.train_start, fold.train_end)
@@ -471,6 +550,12 @@ def run_walk_forward(
             continue
         booster, metrics = fit_and_evaluate(X_tr, y_tr, X_te, y_te, spec)
         last_booster = booster   # track the most recent valid-fold model
+        fold_metric_val = metrics.get(metric_name, float("nan"))
+        if not math.isnan(fold_metric_val) and fold_metric_val > best_booster_metric:
+            best_booster_metric = fold_metric_val
+            best_fold_k = fold.k
+            best_primary_value = fold_metric_val
+        feature_importances = _capture_feature_importances(booster)
         # V79 / Phase 4 D-execution: capture out-of-fold predictions for
         # the backfill path. Dispatch on estimator type:
         #   * lgb.Booster (single-model) -> .predict(X) -> 1D for binary,
@@ -496,24 +581,19 @@ def run_walk_forward(
             random_state=int(spec.hyperparams.get("random_state", 0) or 0),
         )
         metrics["adversarial_auc"] = adv_auc
-        # ES1-followup (conditional invariance — replaces adversarial as
-        # the transferability signal). Binary/regression only for now;
-        # multiclass deferred to the directional spec's retry. We pass
-        # the encoded y for multiclass through as a regression-shaped
-        # vector — the result is still informative (per-class drift
-        # blends into one signal) but the threshold won't be calibrated
-        # for it, so the gate skips multiclass at the gauntlet boundary.
-        if spec.objective in ("binary", "regression"):
-            from .conditional_invariance import conditional_invariance
-            ci_result = conditional_invariance(
-                X_tr, y_tr, X_te, y_te,
-                objective=spec.objective,
-            )
-            metrics["ci_max_abs_diff"] = ci_result.max_abs_diff
-            metrics["ci_mean_abs_diff"] = ci_result.mean_abs_diff
-            metrics["ci_n_pairs_evaluated"] = float(ci_result.n_pairs_evaluated)
-            if ci_result.skipped_reason is not None:
-                metrics["ci_skipped_reason_flag"] = 1.0
+        # Conditional invariance (replaces adversarial AUC as the
+        # transferability signal). Extended to multiclass 2026-05-27 —
+        # per-class P(y=k|bin) divergence, same 0.15 threshold as binary.
+        from .conditional_invariance import conditional_invariance
+        ci_result = conditional_invariance(
+            X_tr, y_tr, X_te, y_te,
+            objective=spec.objective,
+        )
+        metrics["ci_max_abs_diff"] = ci_result.max_abs_diff
+        metrics["ci_mean_abs_diff"] = ci_result.mean_abs_diff
+        metrics["ci_n_pairs_evaluated"] = float(ci_result.n_pairs_evaluated)
+        if ci_result.skipped_reason is not None:
+            metrics["ci_skipped_reason_flag"] = 1.0
         fold_results.append(FoldMetrics(
             fold=fold.k,
             train_start=fold.train_start, train_end=fold.train_end,
@@ -523,6 +603,7 @@ def run_walk_forward(
             features_selected=features_selected,
             oof_predictions=oof_predictions,
             oof_timestamps=oof_timestamps,
+            feature_importances=feature_importances,
         ))
         n_runs += 1
         logger.info(
@@ -546,6 +627,14 @@ def run_walk_forward(
     primary_mean = float(np.mean(primary_values))
     primary_median = float(np.median(primary_values))
     primary_std = float(np.std(primary_values, ddof=0))
+
+    # OLS trend slope: positive = improving, negative = decaying across folds.
+    # NaN when < 2 valid folds (can't fit a line).
+    if len(primary_values) >= 2:
+        fold_indices = np.arange(len(primary_values), dtype=float)
+        primary_fold_trend_slope = float(np.polyfit(fold_indices, primary_values, 1)[0])
+    else:
+        primary_fold_trend_slope = float("nan")
 
     # Mean of EACH reported metric across valid folds. Useful for the
     # secondary metrics (log_loss, accuracy for binary; rmse, mae for
@@ -571,6 +660,10 @@ def run_walk_forward(
         primary_mean=primary_mean,
         primary_median=primary_median,
         primary_std=primary_std,
+        primary_fold_trend_slope=primary_fold_trend_slope,
+        best_fold_k=best_fold_k,
+        best_primary_value=best_primary_value,
+        train_serve_filter_active=train_serve_filter_active,
         metric_means=metric_means,
         folds=fold_results,
         _last_booster=last_booster,
@@ -594,6 +687,10 @@ def walk_forward_to_dict(result: WalkForwardResult) -> dict[str, Any]:
         "primary_mean": result.primary_mean,
         "primary_median": result.primary_median,
         "primary_std": result.primary_std,
+        "primary_fold_trend_slope": result.primary_fold_trend_slope,
+        "best_fold_k": result.best_fold_k,
+        "best_primary_value": result.best_primary_value,
+        "train_serve_filter_active": result.train_serve_filter_active,
         "metric_means": result.metric_means,
         "folds": [
             {
@@ -614,6 +711,8 @@ def walk_forward_to_dict(result: WalkForwardResult) -> dict[str, Any]:
                 # script reads these to populate signal_history.
                 "oof_predictions": list(fm.oof_predictions),
                 "oof_timestamps": [ts.isoformat() for ts in fm.oof_timestamps],
+                # Top-10 gain importances for this fold's booster.
+                "feature_importances": dict(fm.feature_importances),
             }
             for fm in result.folds
         ],
@@ -661,6 +760,18 @@ def train_via_walk_forward(
         spec.name, ds.n_bar_slots_total, ds.n_bar_slots_dropped_nan,
         len(ds.feature_names), spec.label_feature,
     )
+    # Embargo validation: ensure embargo_days covers the label's forward
+    # lookahead window. Unknown labels default to a conservative 1-day
+    # minimum; callers adding new labels should extend _LABEL_MIN_EMBARGO_DAYS.
+    min_embargo = _LABEL_MIN_EMBARGO_DAYS.get(spec.label_feature, 1)
+    if embargo_days < min_embargo:
+        raise ValueError(
+            f"embargo_days={embargo_days} is too small for label "
+            f"'{spec.label_feature}': minimum is {min_embargo} days. "
+            f"A shorter embargo risks train/test label leakage at fold "
+            f"boundaries — the label reads future bars that cross the "
+            f"embargo gap. Increase embargo_days or shorten the label horizon."
+        )
     integrity = run_integrity_or_raise(ds, spec, allow_leakage=allow_leakage)
 
     result = run_walk_forward(

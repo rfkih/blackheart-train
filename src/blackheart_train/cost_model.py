@@ -147,7 +147,9 @@ def _per_trade_atr_units(predicted_class: int, actual_class: int) -> float:
         if actual_class == 0:
             return +K_SL
         if actual_class == 2:
-            return -K_TP
+            # LONG TP hit means price rose K_TP ATR, but short's SL was at
+            # +K_SL ATR (< K_TP), so short SL was triggered first: loss = K_SL.
+            return -K_SL
         return 0.0
     return 0.0
 
@@ -209,9 +211,25 @@ def compute_per_trade_pnl_bps(
     is_short = predicted_classes == 0
     is_actual_tp = y_true_enc == 2
     is_actual_sl = y_true_enc == 0
+    # SHORT scoring fix (MC1): the LONG triple-barrier label records outcomes
+    # against LONG barriers (TP at +K_TP ATR, SL at -K_SL ATR).  When we
+    # infer the short position's outcome from that label:
+    #
+    #   actual=0 (LONG SL hit, price fell K_SL ATR):
+    #     Short TP is at -K_TP ATR; price only fell K_SL < K_TP ATR, so the
+    #     short TP was NOT yet hit.  Conservative credit: short exits at the
+    #     LONG SL level → gains K_SL ATR.  Unchanged from the original.
+    #
+    #   actual=2 (LONG TP hit, price rose K_TP ATR):
+    #     Short SL is at +K_SL ATR < K_TP ATR — it was hit BEFORE the long TP.
+    #     The short lost K_SL ATR, not K_TP ATR.  The original formula used
+    #     -K_TP here, which overstated the short's loss by (K_TP - K_SL) ATR.
+    #
+    # With this fix, short PnL is symmetric at K_SL ATR in both directions,
+    # which is the correct approximation given only the long-side label.
     gross_atr_units = (
         is_long * (is_actual_tp * K_TP - is_actual_sl * K_SL)
-        + is_short * (is_actual_sl * K_SL - is_actual_tp * K_TP)
+        + is_short * K_SL * (is_actual_sl.astype(float) - is_actual_tp.astype(float))
     )
     no_trade = (~take_trade) | (predicted_classes == 1)
     gross_atr_units = np.where(no_trade, 0.0, gross_atr_units)

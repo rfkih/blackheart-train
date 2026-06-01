@@ -312,24 +312,6 @@ def _gate_4_adversarial(payload: dict[str, Any]) -> GateResult:
             "info_note": _GATE_4_ADVERSARIAL_INFO_NOTE,
         },
     )
-    # Multiclass: conditional invariance not yet supported (per the
-    # module's "Non-goals" — needs a per-class formulation). Skip with
-    # a clear rationale so the directional retry sees this immediately.
-    if objective == "multiclass":
-        return GateResult(
-            **common, verdict="SKIP",
-            actual={
-                "adversarial_auc": (
-                    round(float(adv), 4) if _is_finite(adv) else adv
-                ),
-                "ci_max_abs_diff": ci_max,
-            },
-            rationale=(
-                "conditional invariance not yet implemented for multiclass; "
-                "extend conditional_invariance.py before re-attempting "
-                "directional gauntlet"
-            ),
-        )
     if threshold is None:
         return GateResult(
             **common, verdict="FAIL",

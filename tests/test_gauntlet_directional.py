@@ -87,18 +87,16 @@ def _make_directional_payload(
 
 
 def test_all_tier_a_pass_gives_conditional_pass():
-    """Tier A all PASS-or-SKIP, Tier B/C still SKIP → CONDITIONAL_PASS.
-    This is the *best* verdict a current-infra multiclass payload can
-    earn. Gate 4 (transferability / conditional invariance) emits SKIP
-    for multiclass — see ``project_v2_adversarial_auc.md`` for why
-    multiclass CI is deferred. 6 PASS + 1 Tier-A-SKIP + 6 Tier-B/C-SKIP."""
+    """Tier A all PASS (7 gates), Tier B/C still SKIP (6 gates) → CONDITIONAL_PASS.
+    Gate 4 (transferability) now evaluates multiclass via per-class P(y=k|bin)
+    shift — ci_max_abs_diff=0.08 < 0.15 → PASS. 7 PASS + 6 Tier-B/C-SKIP."""
     payload = _make_directional_payload()
     report = run_directional_gauntlet(payload)
     assert report.overall_verdict == "CONDITIONAL_PASS"
-    # 6 binding PASS + (1 gate-4 SKIP + 6 tier-B/C SKIP) = 13 gates
-    assert report.n_pass == 6
+    # 7 Tier-A PASS + 6 Tier-B/C SKIP = 13 gates
+    assert report.n_pass == 7
     assert report.n_fail == 0
-    assert report.n_skip == 7
+    assert report.n_skip == 6
 
 
 def test_any_tier_a_fail_gives_overall_fail():
@@ -167,17 +165,18 @@ def test_gate_3_bootstrap_ci_lower():
     assert g_below.verdict == "FAIL"
 
 
-def test_gate_4_skips_for_multiclass():
-    """Gate 4 (transferability via conditional invariance) is SKIP for
-    multiclass — CI doesn't support per-class shift formulation yet.
-    Replaces the old ``test_gate_4_adversarial_threshold`` which gated
-    on adversarial AUC; per ``project_v2_adversarial_auc.md`` that
-    metric is now info-only.
+def test_gate_4_passes_for_multiclass_when_ci_below_threshold():
+    """Gate 4 evaluates multiclass via per-class P(y=k|bin) shift.
+    ci_max_abs_diff < 0.15 → PASS; ≥ 0.15 → FAIL.
+    Replaces the old ``test_gate_4_skips_for_multiclass`` — multiclass
+    conditional invariance was implemented 2026-05-27.
     """
-    payload = _make_directional_payload(objective="multiclass")
-    g4 = next(g for g in run_directional_gauntlet(payload).gates if g.gate_number == 4)
-    assert g4.verdict == "SKIP"
-    assert "multiclass" in g4.rationale.lower()
+    pass_payload = _make_directional_payload(ci_max_abs_diff=0.08)
+    fail_payload = _make_directional_payload(ci_max_abs_diff=0.20)
+    g4_pass = next(g for g in run_directional_gauntlet(pass_payload).gates if g.gate_number == 4)
+    g4_fail = next(g for g in run_directional_gauntlet(fail_payload).gates if g.gate_number == 4)
+    assert g4_pass.verdict == "PASS"
+    assert g4_fail.verdict == "FAIL"
 
 
 def test_gate_4_binary_passes_below_threshold():

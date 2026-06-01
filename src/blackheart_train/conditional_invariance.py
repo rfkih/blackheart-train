@@ -51,11 +51,12 @@ without touching the per-fold compute.
 Non-goals
 ---------
 
-* Multiclass support is deferred. The 5-gate modulator gauntlet runs on
-  binary/regression specs; the 13-gate directional gauntlet runs on
-  multiclass via ``label_triple_barrier`` and would need a per-class
-  shift formulation (KL or modal-class drift). When the directional
-  spec retries, this module will be extended.
+* Multiclass: for each bin, divergence = max over classes k of
+  |P(y=k|bin,train) − P(y=k|bin,test)|. Same aggregation structure as
+  binary. Probabilities are already in [0,1] so no std-scaling is
+  applied (same as binary). Pass threshold: 0.15 per class-probability
+  shift (same conservative bound as binary — any single class drifting
+  15+ pp per bin is a genuine conditional shift worth flagging).
 * This is a per-fold diagnostic; the gauntlet aggregates across folds
   via mean over per-fold ``max_abs_diff``.
 """
@@ -116,7 +117,7 @@ def conditional_invariance(
     X_test: pd.DataFrame,
     y_test: pd.Series,
     *,
-    objective: Literal["binary", "regression"],
+    objective: Literal["binary", "regression", "multiclass"],
     features: Iterable[str] | None = None,
     n_bins: int = DEFAULT_N_BINS,
     min_bin_samples: int = DEFAULT_MIN_BIN_SAMPLES,
@@ -142,9 +143,10 @@ def conditional_invariance(
     Returns:
         ConditionalInvarianceResult — see dataclass docstring.
     """
-    if objective not in ("binary", "regression"):
+    if objective not in ("binary", "regression", "multiclass"):
         raise ValueError(
-            f"objective must be 'binary' or 'regression', got {objective!r}"
+            f"objective must be 'binary', 'regression', or 'multiclass', "
+            f"got {objective!r}"
         )
     if n_bins < 2:
         raise ValueError(f"n_bins must be >= 2, got {n_bins!r}")
@@ -181,7 +183,7 @@ def conditional_invariance(
         )
 
     # Regression: pre-compute y_train std for normalised divergence.
-    # Binary: raw means are already on [0, 1] so no scaling.
+    # Binary / multiclass: raw probabilities already in [0, 1] — no scaling.
     y_train_arr = y_train.astype(float).to_numpy()
     y_test_arr = y_test.astype(float).to_numpy()
     if objective == "regression":
@@ -198,7 +200,14 @@ def conditional_invariance(
                 skipped_reason="degenerate_train_label",
             )
     else:
-        std = 1.0  # binary: divergence is already a probability shift
+        std = 1.0  # binary / multiclass: probability shift in [0,1]
+
+    # For multiclass, pre-compute the integer class labels once.
+    mc_classes: np.ndarray | None = None
+    if objective == "multiclass":
+        y_tr_int = y_train_arr.astype(int)
+        y_te_int = y_test_arr.astype(int)
+        mc_classes = np.unique(np.concatenate([y_tr_int, y_te_int]))
 
     per_feature_max: dict[str, float] = {}
     all_diffs: list[float] = []
@@ -236,9 +245,22 @@ def conditional_invariance(
             n_te = int(te_mask.sum())
             if n_tr < min_bin_samples or n_te < min_bin_samples:
                 continue
-            tr_mean = float(y_train_arr[tr_mask].mean())
-            te_mean = float(y_test_arr[te_mask].mean())
-            diff = abs(tr_mean - te_mean) / std
+            if objective == "multiclass":
+                # Per-class P(y=k|bin) divergence: max over classes.
+                # Probabilities in [0,1] — no std scaling needed.
+                assert mc_classes is not None
+                y_tr_bin = y_train_arr[tr_mask].astype(int)
+                y_te_bin = y_test_arr[te_mask].astype(int)
+                bin_diff = 0.0
+                for k in mc_classes:
+                    p_tr_k = float((y_tr_bin == k).mean())
+                    p_te_k = float((y_te_bin == k).mean())
+                    bin_diff = max(bin_diff, abs(p_tr_k - p_te_k))
+                diff = bin_diff
+            else:
+                tr_mean = float(y_train_arr[tr_mask].mean())
+                te_mean = float(y_test_arr[te_mask].mean())
+                diff = abs(tr_mean - te_mean) / std
             all_diffs.append(diff)
             if diff > feat_max:
                 feat_max = diff
@@ -277,6 +299,10 @@ def conditional_invariance(
 PASS_THRESHOLD: dict[str, float] = {
     "binary": 0.15,
     "regression": 0.5,
+    # Multiclass: per-class P(y=k|bin) shift — same 15-pp bound as binary.
+    # A single class drifting 15+ pp per feature-bin is a genuine
+    # conditional shift worth blocking.
+    "multiclass": 0.15,
 }
 
 

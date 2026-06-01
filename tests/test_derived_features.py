@@ -63,14 +63,15 @@ def test_derived_features_registry_has_expected_keys():
     }
     assert set(DERIVED_LABELS.keys()) == {
         "label_return_24h",
-        # Phase 4 Session 2 (2026-05-16): label_regime_risk_on_24h was
-        # graduated to feature_registry (V77) and removed from
-        # DERIVED_LABELS. Its transformer function remains importable.
-        # M5g.5: ``label_triple_barrier`` is a derived label so it can
-        # be computed at the 15m aux interval during stacked-interval
-        # training (the registry stores it at 1h only). The 1h numerics
-        # are bit-equal to the registry rows.
         "label_triple_barrier",
+        # 2026-05-21: binary long-win TB label for entry-gate models.
+        "label_long_win_tb_1h_v1",
+        # 2026-05-21 Path C: short-horizon asymmetric-stops variant.
+        "label_long_win_tb_short_v1",
+        # 2026-05-21 Path C late: loose-threshold short-horizon variant.
+        "label_long_win_tb_loose_v1",
+        # 2026-05-27: short-entry mirror for funding-crowding hypothesis.
+        "label_short_win_tb_1h_v1",
     }
 
 
@@ -264,6 +265,35 @@ def test_label_regime_risk_on_24h_is_binary_with_nan_tail():
     finite = out.dropna()
     # Only 0.0 and 1.0 (binary).
     assert set(finite.unique()).issubset({0.0, 1.0})
+
+
+def test_label_short_win_tb_is_binary_with_nan_tail():
+    md = _make_market_data(n=300, seed=7)
+    out = compute_derived_label("label_short_win_tb_1h_v1", {"BTCUSDT": md})
+    assert out.iloc[-24:].isna().all()
+    finite = out.dropna()
+    assert set(finite.unique()).issubset({0.0, 1.0})
+
+
+def test_label_short_win_tb_has_both_classes_on_random_data():
+    md = _make_market_data(n=500, seed=8)
+    out = compute_derived_label("label_short_win_tb_1h_v1", {"BTCUSDT": md})
+    finite = out.dropna()
+    fraction_short_win = (finite == 1.0).sum() / len(finite)
+    assert 0.1 < fraction_short_win < 0.9
+
+
+def test_label_short_win_tb_sum_with_long_win_bounded():
+    """On the same data, long-wins and short-wins are NOT mutually exclusive
+    (a bar can be a neutral expiry for both — neither TP hits within horizon).
+    But they cannot both be 1.0 simultaneously since the barriers are
+    symmetric and a move large enough to hit one side's TP also hits the
+    other side's SL. Verify their sum is never 2.0."""
+    md = _make_market_data(n=500, seed=9)
+    long_out = compute_derived_label("label_long_win_tb_1h_v1", {"BTCUSDT": md})
+    short_out = compute_derived_label("label_short_win_tb_1h_v1", {"BTCUSDT": md})
+    combined = long_out.dropna() + short_out.dropna()
+    assert (combined == 2.0).sum() == 0, "long-win and short-win cannot both be 1 on the same bar"
 
 
 def test_label_regime_risk_on_24h_has_both_classes_on_random_data():
