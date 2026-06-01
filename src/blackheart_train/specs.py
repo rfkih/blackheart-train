@@ -383,6 +383,15 @@ SPECS: dict[str, ModelSpec] = {
         train_end=_TRAIN_END,
         # Empty: all inputs now come from feature_registry via V77.
         derived_features=(),
+        # Cross-symbol OB exclusions: ob_*_eth features are stored
+        # with symbols=NULL (global) so they land in every training
+        # matrix. ETH order-book state is not a valid input for a
+        # BTC model — exclude to prevent cross-symbol leakage.
+        extra_excluded_features=(
+            "ob_spread_bps_eth",
+            "ob_imbalance_eth",
+            "ob_imbalance_momentum_8h_eth",
+        ),
     ),
     "positioning_btc_v2": ModelSpec(
         name="positioning_btc_v2",
@@ -496,6 +505,13 @@ SPECS: dict[str, ModelSpec] = {
         train_start=_TRAIN_START,
         train_end=_TRAIN_END,
         derived_features=(),
+        # Cross-symbol OB exclusions: ETH order-book state is not a
+        # valid input for a BTC model.
+        extra_excluded_features=(
+            "ob_spread_bps_eth",
+            "ob_imbalance_eth",
+            "ob_imbalance_momentum_8h_eth",
+        ),
     ),
     # 2026-05-21: bar-boundary triple-barrier binary directional spec.
     # Addresses the label-misalignment failure mode that falsified the
@@ -516,6 +532,13 @@ SPECS: dict[str, ModelSpec] = {
         train_start=_TRAIN_START,
         train_end=_TRAIN_END,
         derived_features=(),
+        # Cross-symbol OB exclusions: ETH order-book state is not a
+        # valid input for a BTC model.
+        extra_excluded_features=(
+            "ob_spread_bps_eth",
+            "ob_imbalance_eth",
+            "ob_imbalance_momentum_8h_eth",
+        ),
     ),
     # 2026-05-21 (Path B): same triple-barrier binary label as v3, but
     # the registry-resolved input feature set is now AUGMENTED with 5
@@ -546,6 +569,13 @@ SPECS: dict[str, ModelSpec] = {
         train_start=_TRAIN_START,
         train_end=_TRAIN_END,
         derived_features=(),
+        # Cross-symbol OB exclusions: ETH order-book state is not a
+        # valid input for a BTC model.
+        extra_excluded_features=(
+            "ob_spread_bps_eth",
+            "ob_imbalance_eth",
+            "ob_imbalance_momentum_8h_eth",
+        ),
     ),
     # 2026-05-21 (Path C continuation): same registry feature stack as v4
     # (14 features including the 5 V111 bar-level entries) but consumes
@@ -565,6 +595,13 @@ SPECS: dict[str, ModelSpec] = {
         train_start=_TRAIN_START,
         train_end=_TRAIN_END,
         derived_features=(),
+        # Cross-symbol OB exclusions: ETH order-book state is not a
+        # valid input for a BTC model.
+        extra_excluded_features=(
+            "ob_spread_bps_eth",
+            "ob_imbalance_eth",
+            "ob_imbalance_momentum_8h_eth",
+        ),
     ),
     # 2026-05-21 Path C late-session: same V111 feature stack + 6-bar
     # horizon as v5 but k_tp=1.0/k_sl=0.5 (looser). More positive labels
@@ -581,6 +618,13 @@ SPECS: dict[str, ModelSpec] = {
         train_start=_TRAIN_START,
         train_end=_TRAIN_END,
         derived_features=(),
+        # Cross-symbol OB exclusions: ETH order-book state is not a
+        # valid input for a BTC model.
+        extra_excluded_features=(
+            "ob_spread_bps_eth",
+            "ob_imbalance_eth",
+            "ob_imbalance_momentum_8h_eth",
+        ),
     ),
     # 2026-05-27: first SOLUSDT ML regime spec. Mirrors regime_eth_v2 with
     # three differences: symbol=SOLUSDT, interval=4h, train_start=2024-01-01.
@@ -655,11 +699,18 @@ SPECS: dict[str, ModelSpec] = {
         # cannot resolve. Without them the loader picks them up via
         # the global path and the trained artifact's feature_set is
         # unservable.
+        # Cross-symbol OB exclusions: ob_*_btc features are stored
+        # with symbols=NULL (global) so they land in every training
+        # matrix. BTC order-book state is not a valid input for an
+        # ETH regime model — exclude to prevent cross-symbol leakage.
         extra_excluded_features=(
             "fear_greed_value",
             "stablecoin_supply_change_7d",
             "stablecoin_supply_change_30d",
             "eth_btc_ratio_momentum_20d",
+            "ob_spread_bps_btc",
+            "ob_imbalance_btc",
+            "ob_imbalance_momentum_8h_btc",
         ),
     ),
     "regime_eth_sharpe_v1": ModelSpec(
@@ -678,6 +729,11 @@ SPECS: dict[str, ModelSpec] = {
             "stablecoin_supply_change_7d",
             "stablecoin_supply_change_30d",
             "eth_btc_ratio_momentum_20d",
+            # Cross-symbol OB: BTC order-book state is not a valid
+            # input for an ETH model.
+            "ob_spread_bps_btc",
+            "ob_imbalance_btc",
+            "ob_imbalance_momentum_8h_btc",
         ),
     ),
     # 2026-06-01 Microstructure-enhanced ETH regime model.
@@ -704,6 +760,11 @@ SPECS: dict[str, ModelSpec] = {
             "stablecoin_supply_change_7d",
             "stablecoin_supply_change_30d",
             "eth_btc_ratio_momentum_20d",
+            # Cross-symbol OB: BTC order-book state is not a valid
+            # input for an ETH model.
+            "ob_spread_bps_btc",
+            "ob_imbalance_btc",
+            "ob_imbalance_momentum_8h_btc",
         ),
     ),
     # 2026-05-21 Path C — first sidecar-servable ETH directional spec.
@@ -760,11 +821,18 @@ SPECS: dict[str, ModelSpec] = {
         # fetch. Without this exclusion the loader picks them up via
         # its global-feature path and the trained artifact gets a
         # feature_set the sidecar cannot resolve at 1h ts.
+        # Cross-symbol OB exclusions: ob_*_btc features are stored
+        # with symbols=NULL (global) so they land in every training
+        # matrix. BTC order-book state is not a valid input for an
+        # ETH model — exclude to prevent cross-symbol leakage.
         extra_excluded_features=(
             "fear_greed_value",
             "stablecoin_supply_change_7d",
             "stablecoin_supply_change_30d",
             "eth_btc_ratio_momentum_20d",
+            "ob_spread_bps_btc",
+            "ob_imbalance_btc",
+            "ob_imbalance_momentum_8h_btc",
         ),
     ),
     # Phase 3 / M5g foundation — directional model (blueprint § 6.2).
@@ -885,6 +953,11 @@ SPECS: dict[str, ModelSpec] = {
             "btc_dominance_change_7d",
             "eth_btc_ratio_momentum_20d",
             "fear_greed_value",
+            # Cross-symbol OB: ETH order-book state is not a valid
+            # input for a BTC model.
+            "ob_spread_bps_eth",
+            "ob_imbalance_eth",
+            "ob_imbalance_momentum_8h_eth",
         ),
     ),
     # 2026-05-27: funding features with the CORRECT label.
@@ -936,6 +1009,11 @@ SPECS: dict[str, ModelSpec] = {
             "btc_dominance_change_7d",
             "eth_btc_ratio_momentum_20d",
             "fear_greed_value",
+            # Cross-symbol OB: ETH order-book state is not a valid
+            # input for a BTC model.
+            "ob_spread_bps_eth",
+            "ob_imbalance_eth",
+            "ob_imbalance_momentum_8h_eth",
         ),
     ),
     # 2026-05-27: combined bar-level + funding features with the TB label.
@@ -978,6 +1056,11 @@ SPECS: dict[str, ModelSpec] = {
             "btc_dominance_change_7d",
             "eth_btc_ratio_momentum_20d",
             "fear_greed_value",
+            # Cross-symbol OB: ETH order-book state is not a valid
+            # input for a BTC model.
+            "ob_spread_bps_eth",
+            "ob_imbalance_eth",
+            "ob_imbalance_momentum_8h_eth",
         ),
     ),
     # 2026-05-27: funding-crowding → squeeze hypothesis, SHORT side.
@@ -1023,6 +1106,11 @@ SPECS: dict[str, ModelSpec] = {
             "btc_dominance_change_7d",
             "eth_btc_ratio_momentum_20d",
             "fear_greed_value",
+            # Cross-symbol OB: ETH order-book state is not a valid
+            # input for a BTC model.
+            "ob_spread_bps_eth",
+            "ob_imbalance_eth",
+            "ob_imbalance_momentum_8h_eth",
         ),
     ),
     # 2026-05-31 — VBO HYBRID gate candidates.
@@ -1041,6 +1129,13 @@ SPECS: dict[str, ModelSpec] = {
         train_start=_TRAIN_START,
         train_end=_TRAIN_END,
         derived_features=(),
+        # Cross-symbol OB exclusions: ETH order-book state is not a
+        # valid input for a BTC model.
+        extra_excluded_features=(
+            "ob_spread_bps_eth",
+            "ob_imbalance_eth",
+            "ob_imbalance_momentum_8h_eth",
+        ),
     ),
     # v2 — excludes the 4 macro/global features (fear_greed, stablecoin,
     # eth_btc_ratio) that caused only 1 of 6 walk-forward folds to complete
@@ -1062,6 +1157,11 @@ SPECS: dict[str, ModelSpec] = {
             "stablecoin_supply_change_7d",
             "stablecoin_supply_change_30d",
             "eth_btc_ratio_momentum_20d",
+            # Cross-symbol OB: ETH order-book state is not a valid
+            # input for a BTC model.
+            "ob_spread_bps_eth",
+            "ob_imbalance_eth",
+            "ob_imbalance_momentum_8h_eth",
         ),
     ),
     # ETH variant — allows VBO_RESEARCH ETHUSDT HYBRID sweeps to gate on
@@ -1082,6 +1182,11 @@ SPECS: dict[str, ModelSpec] = {
             "stablecoin_supply_change_7d",
             "stablecoin_supply_change_30d",
             "eth_btc_ratio_momentum_20d",
+            # Cross-symbol OB: BTC order-book state is not a valid
+            # input for an ETH model.
+            "ob_spread_bps_btc",
+            "ob_imbalance_btc",
+            "ob_imbalance_momentum_8h_btc",
         ),
     ),
 }
