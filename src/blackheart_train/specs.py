@@ -662,6 +662,50 @@ SPECS: dict[str, ModelSpec] = {
             "eth_btc_ratio_momentum_20d",
         ),
     ),
+    "regime_eth_sharpe_v1": ModelSpec(
+        name="regime_eth_sharpe_v1",
+        purpose="regime",
+        label_feature="label_forward_sharpe_24h",
+        label_version=1,
+        objective="regression",
+        symbol="ETHUSDT",
+        interval="1h",
+        train_start=_TRAIN_START,
+        train_end=_TRAIN_END,
+        derived_features=(),
+        extra_excluded_features=(
+            "fear_greed_value",
+            "stablecoin_supply_change_7d",
+            "stablecoin_supply_change_30d",
+            "eth_btc_ratio_momentum_20d",
+        ),
+    ),
+    # 2026-06-01 Microstructure-enhanced ETH regime model.
+    # Extends regime_eth_v2 with OFI (Order Flow Imbalance) features:
+    # ofi_ratio, ofi_zscore_24h, ofi_momentum_8h, cvd_proxy_zscore_24h.
+    # These are bar-level ETHUSDT/1h features — the sidecar CAN serve them
+    # (symbol='ETHUSDT', interval='1h' rows in feature_values).
+    # OFI features are deliberately NOT excluded so they participate in training.
+    # Same macro exclusions as regime_eth_v2 (sidecar cannot resolve global
+    # symbol=''/interval='' macro rows).
+    "regime_eth_ofi_v1": ModelSpec(
+        name="regime_eth_ofi_v1",
+        purpose="regime",
+        label_feature="label_regime_risk_on_24h",
+        label_version=1,
+        objective="binary",
+        symbol="ETHUSDT",
+        interval="1h",
+        train_start=_TRAIN_START,
+        train_end=_TRAIN_END,
+        derived_features=(),
+        extra_excluded_features=(
+            "fear_greed_value",
+            "stablecoin_supply_change_7d",
+            "stablecoin_supply_change_30d",
+            "eth_btc_ratio_momentum_20d",
+        ),
+    ),
     # 2026-05-21 Path C — first sidecar-servable ETH directional spec.
     # Resolves HARD_RULE_BLOCK_INFERENCE_STAMPING_2026-05-21 (RUN_SUMMARY
     # 21f4e296): blackheart-inference/repo/features.py exact-matches
