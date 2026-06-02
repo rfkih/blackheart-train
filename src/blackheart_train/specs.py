@@ -1214,7 +1214,7 @@ SPECS: dict[str, ModelSpec] = {
         interval="1h",
         train_start=_TRAIN_START,
         train_end=_TRAIN_END,
-        derived_features=("label_long_win_tb_eth_1h_v1",),
+        derived_features=(),
         extra_excluded_features=(
             # Macro / global daily features — sidecar cannot resolve
             "fear_greed_value",
