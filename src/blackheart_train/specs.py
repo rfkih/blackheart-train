@@ -1461,7 +1461,7 @@ SPECS: dict[str, ModelSpec] = {
         interval="1h",
         train_start=_TRAIN_START,
         train_end=_TRAIN_END,
-        derived_features=("label_fwd_return_pctrank_90d",),
+        derived_features=(),
         extra_excluded_features=(
             "btc_log_return_1h",
             "btc_log_return_4h",
@@ -1513,7 +1513,7 @@ SPECS: dict[str, ModelSpec] = {
         interval="1h",
         train_start=_TRAIN_START,
         train_end=_TRAIN_END,
-        derived_features=("label_fwd_return_pctrank_90d",),
+        derived_features=(),
         extra_excluded_features=(
             # Non-stationary OFI (replaced by pctrank_90d variants)
             "ofi_ratio",
