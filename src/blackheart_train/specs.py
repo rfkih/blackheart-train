@@ -304,6 +304,39 @@ class ModelSpec:
                 f"spec={self.name}: early_stopping_val_fraction must be in "
                 f"(0, 1) (got {self.early_stopping_val_fraction!r})"
             )
+        # 2026-06-02: validate derived_features entries at construction.
+        # The label is resolved separately via spec.label_feature +
+        # DERIVED_LABELS; listing a label name in derived_features is a
+        # common wiring mistake (happened 3× on the OFI/funding specs) that
+        # previously surfaced only as a KeyError ~40s into the training
+        # subprocess, consuming an ML-budget slot. Catch it here instead.
+        #
+        # Lazy import guards the specs<->derived_features circular edge
+        # (derived_features imports ModelSpec). Only triggered when
+        # derived_features is non-empty, so the common empty-tuple specs
+        # constructed during module load never touch the import.
+        if self.derived_features:
+            try:
+                from .derived_features import DERIVED_FEATURES, DERIVED_LABELS
+            except ImportError:
+                # Mid-circular-import: derived_features not fully loaded.
+                # Skip — the loader re-validates names at fetch time.
+                DERIVED_FEATURES = DERIVED_LABELS = None  # type: ignore[assignment]
+            if DERIVED_FEATURES is not None:
+                for feat in self.derived_features:
+                    if feat in DERIVED_LABELS:
+                        raise ValueError(
+                            f"spec={self.name}: {feat!r} is a label "
+                            f"(in DERIVED_LABELS), not a derived feature. "
+                            f"Labels are consumed via label_feature; set "
+                            f"derived_features=() and label_feature={feat!r}."
+                        )
+                    if feat not in DERIVED_FEATURES:
+                        raise ValueError(
+                            f"spec={self.name}: derived feature {feat!r} not "
+                            f"in DERIVED_FEATURES. Known: "
+                            f"{sorted(DERIVED_FEATURES)}"
+                        )
 
 
 # Locked training window for M5 (blueprint § 19): the 17-month gate window

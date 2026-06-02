@@ -154,6 +154,55 @@ def _check_min_rows(ds: LoadedDataset, min_rows: int) -> CheckResult:
     )
 
 
+_LABEL_STATIONARITY_DRIFT_WARN = 0.15
+
+
+def _check_label_stationarity(ds: LoadedDataset) -> CheckResult:
+    """Compare the binary label base-rate between the first and second
+    chronological half of the dataset.
+
+    A large base-rate drift means the label's meaning shifts over time —
+    e.g. a triple-barrier win-rate that tracks the prevailing market trend
+    regime (high in 2024-25 bull, low in 2022 chop). Downstream this
+    manifests as ``adversarial_auc ≈ 1.0`` (the model/adversary separates
+    epochs from the label alone), which is only discovered after the full
+    walk-forward + gauntlet (30-90 min). This cheap pre-check surfaces the
+    risk in the artifact *before* that spend.
+
+    WARN-only — it never blocks an exploratory run, it just flags it.
+    """
+    n = len(ds.y)
+    if n < 200:
+        return CheckResult(
+            name="label_stationarity", severity="PASS",
+            message="too few rows to assess", details={"n_rows": n},
+        )
+    y = ds.y.astype("float64")
+    p_first = float(y.iloc[: n // 2].mean())
+    p_second = float(y.iloc[n // 2 :].mean())
+    drift = abs(p_first - p_second)
+    details = {
+        "first_half_mean": round(p_first, 4),
+        "second_half_mean": round(p_second, 4),
+        "drift": round(drift, 4),
+    }
+    if drift > _LABEL_STATIONARITY_DRIFT_WARN:
+        return CheckResult(
+            name="label_stationarity", severity="WARN",
+            message=(
+                f"label base-rate drifts {drift:.2f} between first/second half "
+                f"({p_first:.2f} -> {p_second:.2f}) — non-stationary label, "
+                f"expect elevated adversarial_auc / weak transferability"
+            ),
+            details=details,
+        )
+    return CheckResult(
+        name="label_stationarity", severity="PASS",
+        message=f"label base-rate drift {drift:.2f} within tolerance",
+        details=details,
+    )
+
+
 def _check_binary_class_balance(ds: LoadedDataset) -> CheckResult:
     counts = ds.y.astype(int).value_counts().to_dict()
     total = sum(counts.values())
@@ -637,6 +686,7 @@ def check_dataset(
     if spec.objective == "binary":
         checks.append(_check_binary_class_balance(ds))
         checks.append(_check_train_val_class_balance(ds, spec))
+        checks.append(_check_label_stationarity(ds))
     elif spec.objective == "multiclass":
         checks.append(_check_multiclass_class_balance(ds))
     else:

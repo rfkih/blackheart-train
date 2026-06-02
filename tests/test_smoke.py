@@ -68,6 +68,8 @@ def test_locked_specs_exist():
         # funding_regime_v1 kept for registry continuity (label fixed in v2).
         "funding_regime_v1",
         "regime_sol_v1",
+        # 2026-05: ETH Sharpe-labelled regime variant.
+        "regime_eth_sharpe_v1",
         # funding_entry_v1: same 4 funding features as funding_regime_v1 but
         # with the correct label (label_long_win_tb_1h_v1 instead of the
         # wrong price-action regime label).
@@ -80,6 +82,22 @@ def test_locked_specs_exist():
         # tests the crowding→squeeze hypothesis (high funding → longs crowded
         # → short entries win).
         "funding_short_v1",
+        # 2026-05-31: VBO HYBRID gate candidates (regime re-trains).
+        "regime_vbo_btc_v1",
+        "regime_vbo_btc_v2",
+        "regime_vbo_eth_v1",
+        # 2026-06-02: OFI microstructure specs (all falsified — adversarial_auc≈1.0).
+        "regime_eth_ofi_v1",
+        "directional_eth_ofi_1h_v1",
+        "directional_btc_ofi_1h_v1",
+        "directional_eth_ofi_4h_v1",
+        # 2026-06-02: stationary-feature OFI specs (pctrank_90d inputs).
+        "directional_btc_ofi_1h_v2",
+        "directional_eth_ofi_1h_v2",
+        "directional_eth_ofi_4h_v2",
+        # 2026-06-02: stationary-label specs (90d-pctrank forward-return target).
+        "funding_entry_v2",
+        "directional_btc_ofi_1h_v3",
     }
 
 

@@ -72,6 +72,12 @@ def test_derived_features_registry_has_expected_keys():
         "label_long_win_tb_loose_v1",
         # 2026-05-27: short-entry mirror for funding-crowding hypothesis.
         "label_short_win_tb_1h_v1",
+        # 2026-06-02: ETH-native triple-barrier labels (1h + 4h) for OFI specs.
+        "label_long_win_tb_eth_1h_v1",
+        "label_long_win_tb_eth_4h_v1",
+        # 2026-06-02: stationary 90d-pctrank forward-return labels (BTC + ETH).
+        "label_fwd_return_pctrank_90d",
+        "label_fwd_return_pctrank_90d_eth",
     }
 
 
@@ -100,10 +106,12 @@ def test_required_symbols_for_v2_spec_picks_up_eth_btc():
 
 
 def test_required_symbols_for_unknown_feature_raises():
+    # 2026-06-02: ModelSpec.__post_init__ now validates derived_features at
+    # construction, so an unknown name is rejected at replace()-time with a
+    # ValueError — earlier and clearer than the old load-time KeyError.
     from dataclasses import replace
-    spec = replace(get_spec("regime_btc_v1"), derived_features=("does_not_exist",))
-    with pytest.raises(KeyError, match="unknown derived feature"):
-        required_symbols_for(spec)
+    with pytest.raises(ValueError, match="not in DERIVED_FEATURES"):
+        replace(get_spec("regime_btc_v1"), derived_features=("does_not_exist",))
 
 
 def test_v2_specs_carry_deployment_readiness_signal():
