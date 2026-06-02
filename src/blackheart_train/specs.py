@@ -1189,6 +1189,54 @@ SPECS: dict[str, ModelSpec] = {
             "ob_imbalance_momentum_8h_btc",
         ),
     ),
+    # 2026-06-02: OFI microstructure directional model for ETHUSDT.
+    # regime_eth_ofi_v1 was falsified (adversarial_auc=0.9983) because
+    # regime classification via the forward-Sharpe label suffers severe
+    # covariate shift on OFI features. Reframed as a directional (entry-
+    # quality) model using the ETH triple-barrier label: the question
+    # changes from "is the market regime risk-on?" to "if I enter long
+    # here, does TP hit before SL in 24 bars?" — a question OFI context
+    # can plausibly answer (high buy-side imbalance → elevated TP probability).
+    # Uses label_long_win_tb_eth_1h_v1 (new ETH-native derived label),
+    # purpose="directional" → routes through 13-gate gauntlet_directional.
+    # Feature set: all sidecar-servable ETHUSDT/1h features PLUS the 4 OFI
+    # features (ofi_ratio, ofi_zscore_24h, ofi_momentum_8h,
+    # cvd_proxy_zscore_24h) which are in feature_values at ~406k rows 2022-26.
+    # Excludes macro/global features (sidecar cannot resolve daily cadence)
+    # and cross-symbol BTC OB (not valid ETH inputs).
+    "directional_eth_ofi_1h_v1": ModelSpec(
+        name="directional_eth_ofi_1h_v1",
+        purpose="directional",
+        label_feature="label_long_win_tb_eth_1h_v1",
+        label_version=1,
+        objective="binary",
+        symbol="ETHUSDT",
+        interval="1h",
+        train_start=_TRAIN_START,
+        train_end=_TRAIN_END,
+        derived_features=("label_long_win_tb_eth_1h_v1",),
+        extra_excluded_features=(
+            # Macro / global daily features — sidecar cannot resolve
+            "fear_greed_value",
+            "stablecoin_supply_change_7d",
+            "stablecoin_supply_change_30d",
+            "eth_btc_ratio_momentum_20d",
+            "vix_close",
+            "dxy_close",
+            "dxy_zscore_30d",
+            "real_yield_10y_level",
+            "real_yield_10y_change_20d",
+            "dxy_zscore_252d",
+            "dxy_momentum_20d",
+            "vix_percentile_252d",
+            "term_spread_2s10s",
+            "btc_dominance_change_7d",
+            # Cross-symbol OB: BTC order-book state is not valid for ETH
+            "ob_spread_bps_btc",
+            "ob_imbalance_btc",
+            "ob_imbalance_momentum_8h_btc",
+        ),
+    ),
 }
 
 
