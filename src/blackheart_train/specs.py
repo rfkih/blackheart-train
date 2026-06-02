@@ -64,6 +64,18 @@ EXCLUDED_FROM_INPUTS: frozenset[str] = frozenset({
     "taker_buy_ratio_4h",
     "topls_ratio_change_24h",
     "btc_dominance_change_7d",
+    # 2026-06-02: Binance public futures-data endpoints cap history at
+    # ~30 days, so these three Tier-C features only ever hold ~500 rows
+    # in feature_values. Left un-excluded they leak into every spec that
+    # does not keep dense bar-level features as join ballast — the inner
+    # join's dropna() then collapses the training matrix below the
+    # min_rows=1000 integrity floor. funding_entry_v1 (funding-only, no
+    # bar ballast) dropped to 478 rows purely because these co-loaded.
+    # They are unfixable (source-side cap), so exclude globally — same
+    # rationale as btc_oi_change_24h_pct already in this set.
+    "btc_taker_extreme_flag",
+    "btc_taker_imbalance_momentum_8h",
+    "btc_oi_accel_4h",
 })
 
 
