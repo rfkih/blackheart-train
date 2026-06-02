@@ -1444,6 +1444,103 @@ SPECS: dict[str, ModelSpec] = {
             "ob_imbalance_momentum_8h_btc",
         ),
     ),
+    # 2026-06-02: Stationary-label funding spec.
+    # funding_entry_v1 falsified (adversarial_auc=1.0) because
+    # label_long_win_tb_1h_v1 is non-stationary (TB win/loss rate drifts
+    # year-over-year with BTC trend regime). This v2 replaces the triple-
+    # barrier label with label_fwd_return_pctrank_90d — 90-day percentile
+    # rank of 24h forward log-return — which is [0,1] uniform by construction.
+    # Same 4 funding features, same exclusions as funding_entry_v1.
+    "funding_entry_v2": ModelSpec(
+        name="funding_entry_v2",
+        purpose="directional",
+        label_feature="label_fwd_return_pctrank_90d",
+        label_version=1,
+        objective="binary",
+        symbol="BTCUSDT",
+        interval="1h",
+        train_start=_TRAIN_START,
+        train_end=_TRAIN_END,
+        derived_features=("label_fwd_return_pctrank_90d",),
+        extra_excluded_features=(
+            "btc_log_return_1h",
+            "btc_log_return_4h",
+            "btc_log_return_24h",
+            "btc_realized_vol_7d",
+            "btc_realized_vol_30d",
+            "btc_volume_zscore_24h",
+            "btc_volume_zscore_4h",
+            "btc_rsi_14_1h",
+            "btc_atr_ratio_14_24",
+            "eth_btc_corr_24h",
+            "vix_close",
+            "dxy_close",
+            "dxy_zscore_30d",
+            "real_yield_10y_level",
+            "real_yield_10y_change_20d",
+            "dxy_zscore_252d",
+            "dxy_momentum_20d",
+            "vix_percentile_252d",
+            "term_spread_2s10s",
+            "stablecoin_supply_change_7d",
+            "stablecoin_supply_change_30d",
+            "btc_dominance_change_7d",
+            "eth_btc_ratio_momentum_20d",
+            "fear_greed_value",
+            "ob_spread_bps_eth",
+            "ob_imbalance_eth",
+            "ob_imbalance_momentum_8h_eth",
+            # Non-stationary OFI
+            "ofi_ratio",
+            "ofi_zscore_24h",
+            "ofi_momentum_8h",
+            "cvd_proxy_zscore_24h",
+        ),
+    ),
+    # 2026-06-02: Stationary-label OFI spec for BTCUSDT 1h.
+    # directional_btc_ofi_1h_v2 used stationary pctrank OFI features but
+    # the triple-barrier label was still non-stationary (adversarial_auc=1.0).
+    # This v3 combines stationary pctrank OFI features (V141) with the
+    # stationary pctrank forward-return label — both inputs and target are
+    # [0,1] uniform, eliminating epoch-separation from both ends.
+    "directional_btc_ofi_1h_v3": ModelSpec(
+        name="directional_btc_ofi_1h_v3",
+        purpose="directional",
+        label_feature="label_fwd_return_pctrank_90d",
+        label_version=1,
+        objective="binary",
+        symbol="BTCUSDT",
+        interval="1h",
+        train_start=_TRAIN_START,
+        train_end=_TRAIN_END,
+        derived_features=("label_fwd_return_pctrank_90d",),
+        extra_excluded_features=(
+            # Non-stationary OFI (replaced by pctrank_90d variants)
+            "ofi_ratio",
+            "ofi_zscore_24h",
+            "ofi_momentum_8h",
+            "cvd_proxy_zscore_24h",
+            # Macro / global daily
+            "fear_greed_value",
+            "stablecoin_supply_change_7d",
+            "stablecoin_supply_change_30d",
+            "eth_btc_ratio_momentum_20d",
+            "vix_close",
+            "dxy_close",
+            "dxy_zscore_30d",
+            "real_yield_10y_level",
+            "real_yield_10y_change_20d",
+            "dxy_zscore_252d",
+            "dxy_momentum_20d",
+            "vix_percentile_252d",
+            "term_spread_2s10s",
+            "btc_dominance_change_7d",
+            # Cross-symbol OB
+            "ob_spread_bps_eth",
+            "ob_imbalance_eth",
+            "ob_imbalance_momentum_8h_eth",
+        ),
+    ),
 }
 
 

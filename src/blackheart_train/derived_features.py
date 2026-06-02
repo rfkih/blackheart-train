@@ -160,6 +160,44 @@ def _t_label_regime_risk_on_24h(md: dict[str, pd.DataFrame]) -> pd.Series:
     return binary.rename("label_regime_risk_on_24h")
 
 
+def _t_label_fwd_return_pctrank_90d(md: dict[str, pd.DataFrame]) -> pd.Series:
+    """Stationary binary label: 1 if the 24h forward log-return for BTCUSDT
+    ranks in the top half of the trailing 90-day (2160-bar at 1h) window.
+
+    Fixes adversarial_auc≈1.0 on triple-barrier labels: the TB win/loss
+    rate drifts year-over-year (bull 2024-25 vs. choppy 2022). Percentile
+    rank forces [0,1] uniform distribution regardless of epoch — the
+    adversarial classifier cannot identify the year from the label alone.
+
+    Label = 1 (above-median forward return in the trailing window)
+          = 0 (at or below median)
+          = NaN (last 24 bars, or first 2160-bar warmup)
+    PIT-safe: uses forward bars t+1..t+24 so no lookahead within the bar.
+    """
+    window = 2160
+    min_periods = 720
+    close = md["BTCUSDT"]["close_price"].astype("float64")
+    fwd_log_ret = np.log(close.shift(-24) / close)
+    pctrank = fwd_log_ret.rolling(window, min_periods=min_periods).rank(pct=True)
+    binary = (pctrank > 0.5).astype("float64")
+    binary[pctrank.isna()] = np.nan
+    return binary.rename("label_fwd_return_pctrank_90d")
+
+
+def _t_label_fwd_return_pctrank_90d_eth(md: dict[str, pd.DataFrame]) -> pd.Series:
+    """ETH-native stationary binary label — same mechanics as
+    _t_label_fwd_return_pctrank_90d but computed from ETHUSDT price data.
+    """
+    window = 2160
+    min_periods = 720
+    close = md["ETHUSDT"]["close_price"].astype("float64")
+    fwd_log_ret = np.log(close.shift(-24) / close)
+    pctrank = fwd_log_ret.rolling(window, min_periods=min_periods).rank(pct=True)
+    binary = (pctrank > 0.5).astype("float64")
+    binary[pctrank.isna()] = np.nan
+    return binary.rename("label_fwd_return_pctrank_90d_eth")
+
+
 def _atr(md_btc: pd.DataFrame, n: int = 14) -> pd.Series:
     """Average True Range over ``n`` bars (SMA, matches the
     blackheart-ingest registry transformer's choice — Wilder's EMA
@@ -633,6 +671,23 @@ DERIVED_LABELS: dict[str, DerivedFeature] = {
     # Identical mechanics to label_long_win_tb_1h_v1 (k_tp=1.5, k_sl=1.0,
     # horizon=24, atr_window=14) but computed from ETHUSDT price data.
     # Required by directional_eth_ofi_1h_v1.
+    # 2026-06-02: Stationary binary labels — 90-day pctrank of 24h forward
+    # log-return. Fixes adversarial_auc≈1.0 on triple-barrier labels whose
+    # win/loss rate drifts year-over-year. [0,1] uniform by construction.
+    "label_fwd_return_pctrank_90d": DerivedFeature(
+        name="label_fwd_return_pctrank_90d",
+        family="label",
+        required_symbols=("BTCUSDT",),
+        transformer=_t_label_fwd_return_pctrank_90d,
+        pit_safe=False,
+    ),
+    "label_fwd_return_pctrank_90d_eth": DerivedFeature(
+        name="label_fwd_return_pctrank_90d_eth",
+        family="label",
+        required_symbols=("ETHUSDT",),
+        transformer=_t_label_fwd_return_pctrank_90d_eth,
+        pit_safe=False,
+    ),
     "label_long_win_tb_eth_1h_v1": DerivedFeature(
         name="label_long_win_tb_eth_1h_v1",
         family="label",
