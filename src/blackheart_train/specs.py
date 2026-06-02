@@ -1289,7 +1289,7 @@ SPECS: dict[str, ModelSpec] = {
     "directional_eth_ofi_4h_v1": ModelSpec(
         name="directional_eth_ofi_4h_v1",
         purpose="directional",
-        label_feature="label_long_win_tb_eth_1h_v1",
+        label_feature="label_long_win_tb_eth_4h_v1",
         label_version=1,
         objective="binary",
         symbol="ETHUSDT",

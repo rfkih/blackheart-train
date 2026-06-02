@@ -471,12 +471,10 @@ DERIVED_FEATURES: dict[str, DerivedFeature] = {
 
 
 def _t_label_long_win_tb_eth(md: dict[str, pd.DataFrame]) -> pd.Series:
-    """ETH-native long-win triple-barrier label (2026-06-02).
+    """ETH-native long-win triple-barrier label on 1h bars (2026-06-02).
 
     Identical mechanics to :func:`_t_label_long_win_tb` (k_tp=1.5,
-    k_sl=1.0, horizon=24, atr_window=14) but uses ETHUSDT price data.
-    Required so OFI microstructure features for ETHUSDT can be trained
-    against a correct same-symbol entry-quality label.
+    k_sl=1.0, horizon=24 bars = 24h, atr_window=14) but uses ETHUSDT.
     """
     horizon_bars = 24
     k_tp = 1.5
@@ -508,6 +506,45 @@ def _t_label_long_win_tb_eth(md: dict[str, pd.DataFrame]) -> pd.Series:
     labels[~(np.isfinite(atr_v) & (atr_v > 0))] = np.nan
     out[:last_t] = labels
     return pd.Series(out, index=df.index, name="label_long_win_tb_eth_1h_v1")
+
+
+def _t_label_long_win_tb_eth_4h(md: dict[str, pd.DataFrame]) -> pd.Series:
+    """ETH-native long-win triple-barrier label on 4h bars (2026-06-02).
+
+    Same mechanics (k_tp=1.5, k_sl=1.0, horizon=24 bars = 96h, atr_window=14)
+    on ETHUSDT 4h price data. Required by directional_eth_ofi_4h_v1 so 4h
+    OFI features align natively to 4h bars.
+    """
+    horizon_bars = 24
+    k_tp = 1.5
+    k_sl = 1.0
+    atr_window = 14
+    df = md["ETHUSDT"]
+    c = df["close_price"].astype("float64").to_numpy()
+    h = df["high_price"].astype("float64").to_numpy()
+    lo = df["low_price"].astype("float64").to_numpy()
+    atr = _atr(df, atr_window).to_numpy()
+    n = len(c)
+    out = np.full(n, np.nan, dtype="float64")
+    last_t = n - horizon_bars
+    if last_t <= 0:
+        return pd.Series(out, index=df.index, name="label_long_win_tb_eth_4h_v1")
+    h_win = sliding_window_view(h, horizon_bars)[1 : 1 + last_t]
+    lo_win = sliding_window_view(lo, horizon_bars)[1 : 1 + last_t]
+    entry = c[:last_t]
+    atr_v = atr[:last_t]
+    tp_lvl = entry + k_tp * atr_v
+    sl_lvl = entry - k_sl * atr_v
+    sl_hit = lo_win <= sl_lvl[:, None]
+    tp_hit = h_win >= tp_lvl[:, None]
+    sl_any = sl_hit.any(axis=1)
+    tp_any = tp_hit.any(axis=1)
+    sl_idx = np.where(sl_any, sl_hit.argmax(axis=1), horizon_bars)
+    tp_idx = np.where(tp_any, tp_hit.argmax(axis=1), horizon_bars)
+    labels = (tp_idx < sl_idx).astype("float64")
+    labels[~(np.isfinite(atr_v) & (atr_v > 0))] = np.nan
+    out[:last_t] = labels
+    return pd.Series(out, index=df.index, name="label_long_win_tb_eth_4h_v1")
 
 
 DERIVED_LABELS: dict[str, DerivedFeature] = {
@@ -592,17 +629,28 @@ DERIVED_LABELS: dict[str, DerivedFeature] = {
         transformer=_t_label_short_win_tb,
         pit_safe=False,
     ),
-    # 2026-06-02: ETH-native long-win triple-barrier label.
+    # 2026-06-02: ETH-native long-win triple-barrier label (1h bars).
     # Identical mechanics to label_long_win_tb_1h_v1 (k_tp=1.5, k_sl=1.0,
     # horizon=24, atr_window=14) but computed from ETHUSDT price data.
-    # Required by directional_eth_ofi_1h_v1 so OFI features can be trained
-    # against a correct same-symbol entry-quality label rather than the
-    # regime/forward-Sharpe label (which showed adversarial_auc≈1.0 on OFI).
+    # Required by directional_eth_ofi_1h_v1.
     "label_long_win_tb_eth_1h_v1": DerivedFeature(
         name="label_long_win_tb_eth_1h_v1",
         family="label",
         required_symbols=("ETHUSDT",),
         transformer=_t_label_long_win_tb_eth,
+        pit_safe=False,
+    ),
+    # 2026-06-02: ETH-native long-win triple-barrier label (4h bars).
+    # Same mechanics (k_tp=1.5, k_sl=1.0, horizon=24, atr_window=14) on
+    # ETHUSDT 4h price data — 24-bar horizon = 96h (4 days) holding period.
+    # Required by directional_eth_ofi_4h_v1 so the 4h OFI features align
+    # natively to 4h bars without the row-count collapse that occurs when
+    # the 1h label is joined to 4h features (100 rows → < 1000 floor).
+    "label_long_win_tb_eth_4h_v1": DerivedFeature(
+        name="label_long_win_tb_eth_4h_v1",
+        family="label",
+        required_symbols=("ETHUSDT",),
+        transformer=_t_label_long_win_tb_eth_4h,
         pit_safe=False,
     ),
 }
