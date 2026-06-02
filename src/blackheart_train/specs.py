@@ -1237,6 +1237,87 @@ SPECS: dict[str, ModelSpec] = {
             "ob_imbalance_momentum_8h_btc",
         ),
     ),
+    # 2026-06-02: BTC OFI directional — pivot from falsified ETH variants.
+    # directional_eth_ofi_1h_v1 and regime_eth_ofi_v1 both showed
+    # adversarial_auc ≈ 1.0 (structural OFI covariate shift on ETH 1h).
+    # BTC OFI may behave differently: deeper liquidity, more institutional
+    # participation, and larger absolute volume may produce more stationary
+    # OFI distributions. Uses the existing label_long_win_tb_1h_v1 (BTC TB).
+    # OFI features for BTCUSDT verified present at ~406k rows 2022-2026.
+    "directional_btc_ofi_1h_v1": ModelSpec(
+        name="directional_btc_ofi_1h_v1",
+        purpose="directional",
+        label_feature="label_long_win_tb_1h_v1",
+        label_version=1,
+        objective="binary",
+        symbol="BTCUSDT",
+        interval="1h",
+        train_start=_TRAIN_START,
+        train_end=_TRAIN_END,
+        derived_features=(),
+        extra_excluded_features=(
+            # Macro / global daily features
+            "fear_greed_value",
+            "stablecoin_supply_change_7d",
+            "stablecoin_supply_change_30d",
+            "eth_btc_ratio_momentum_20d",
+            "vix_close",
+            "dxy_close",
+            "dxy_zscore_30d",
+            "real_yield_10y_level",
+            "real_yield_10y_change_20d",
+            "dxy_zscore_252d",
+            "dxy_momentum_20d",
+            "vix_percentile_252d",
+            "term_spread_2s10s",
+            "btc_dominance_change_7d",
+            # Cross-symbol OB: ETH order-book state not valid for BTC
+            "ob_spread_bps_eth",
+            "ob_imbalance_eth",
+            "ob_imbalance_momentum_8h_eth",
+        ),
+    ),
+    # 2026-06-02: ETH OFI at 4h interval.
+    # ETH 1h OFI showed adversarial_auc ≈ 1.0 (covariate shift in the
+    # 1h feature distribution). Longer horizon (4h aggregation) reduces
+    # noise and may produce more stationary OFI distributions. The 4h
+    # ETH OFI features (~406k rows 2022-2026) represent different temporal
+    # aggregation of the same microstructure signal.
+    # Uses ETH triple-barrier label at 4h — label_long_win_tb_eth_1h_v1
+    # is available (computed from ETHUSDT 1h bars; the horizon_bars=24
+    # maps to 24h at 1h and 96h at 4h — a different holding period).
+    "directional_eth_ofi_4h_v1": ModelSpec(
+        name="directional_eth_ofi_4h_v1",
+        purpose="directional",
+        label_feature="label_long_win_tb_eth_1h_v1",
+        label_version=1,
+        objective="binary",
+        symbol="ETHUSDT",
+        interval="4h",
+        train_start=_TRAIN_START,
+        train_end=_TRAIN_END,
+        derived_features=(),
+        extra_excluded_features=(
+            "fear_greed_value",
+            "stablecoin_supply_change_7d",
+            "stablecoin_supply_change_30d",
+            "eth_btc_ratio_momentum_20d",
+            "vix_close",
+            "dxy_close",
+            "dxy_zscore_30d",
+            "real_yield_10y_level",
+            "real_yield_10y_change_20d",
+            "dxy_zscore_252d",
+            "dxy_momentum_20d",
+            "vix_percentile_252d",
+            "term_spread_2s10s",
+            "btc_dominance_change_7d",
+            # Cross-symbol OB: BTC order-book state not valid for ETH
+            "ob_spread_bps_btc",
+            "ob_imbalance_btc",
+            "ob_imbalance_momentum_8h_btc",
+        ),
+    ),
 }
 
 
