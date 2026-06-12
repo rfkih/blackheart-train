@@ -956,6 +956,11 @@ def build_payload(
         "per_feature_pct_non_null": dict(ds.per_feature_pct_non_null),
         "label_feature": ds.label_feature,
         "label_version": ds.label_version,
+        # Registry versions the model trained against — inference pins to
+        # these instead of re-resolving latest-registered at serve time.
+        # Payload-only (NOT part of content_dict): existing artifact shas
+        # are unchanged. Derived features are absent (not registry-backed).
+        "feature_versions": dict(ds.feature_versions),
         "deployment_readiness": {
             "deployment_ready": deployment_ready,
             "unregistered_input_features": unregistered_features,

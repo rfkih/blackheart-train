@@ -70,6 +70,10 @@ class _FeatureMatrixCache:
     feature_names: tuple[str, ...]
     per_feature_non_null: dict[str, int]
     bar_index: pd.DatetimeIndex
+    # Registry version actually used per feature — pinned into the
+    # artifact so inference serves the trained-against versions instead
+    # of re-resolving latest-registered at serve time (train/serve skew).
+    feature_versions: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -99,6 +103,9 @@ class LoadedDataset:
     per_feature_pct_non_null: dict[str, float] = field(default_factory=dict)
     label_feature: str = ""
     label_version: int = 0
+    # Registry feature → version used at training time. Derived features
+    # (computed in-train, not registry-backed) are absent by design.
+    feature_versions: dict[str, int] = field(default_factory=dict)
 
 
 # ── Registry queries ─────────────────────────────────────────────────────────
@@ -389,6 +396,7 @@ def _fetch_feature_matrix(conn: psycopg.Connection, spec: ModelSpec) -> _Feature
     feature_names: list[str] = []
     cols: dict[str, pd.Series] = {}
     per_feature_non_null: dict[str, int] = {}
+    feature_versions: dict[str, int] = {}
 
     for meta in per_bar_metas:
         name = meta["feature_name"]
@@ -402,6 +410,7 @@ def _fetch_feature_matrix(conn: psycopg.Connection, spec: ModelSpec) -> _Feature
         feature_names.append(name)
         cols[name] = aligned
         per_feature_non_null[name] = non_null
+        feature_versions[name] = int(version)
 
     for meta in global_metas:
         name = meta["feature_name"]
@@ -424,12 +433,14 @@ def _fetch_feature_matrix(conn: psycopg.Connection, spec: ModelSpec) -> _Feature
         feature_names.append(name)
         cols[name] = aligned
         per_feature_non_null[name] = non_null
+        feature_versions[name] = int(version)
 
     return _FeatureMatrixCache(
         cols=cols,
         feature_names=tuple(feature_names),
         per_feature_non_null=per_feature_non_null,
         bar_index=bar_index,
+        feature_versions=feature_versions,
     )
 
 
@@ -596,6 +607,7 @@ def load_dataset(
         per_feature_pct_non_null=per_feature_pct,
         label_feature=spec.label_feature,
         label_version=spec.label_version,
+        feature_versions=dict(fmc.feature_versions),
     )
 
 
@@ -686,6 +698,7 @@ def _fetch_aux_feature_matrix(
     feature_names: list[str] = []
     cols: dict[str, pd.Series] = {}
     per_feature_non_null: dict[str, int] = {}
+    feature_versions: dict[str, int] = {}
 
     for meta in per_bar_metas:
         name = meta["feature_name"]
@@ -704,6 +717,7 @@ def _fetch_aux_feature_matrix(
         feature_names.append(name)
         cols[name] = aligned
         per_feature_non_null[name] = non_null
+        feature_versions[name] = int(version)
 
     for meta in global_metas:
         name = meta["feature_name"]
@@ -732,12 +746,14 @@ def _fetch_aux_feature_matrix(
         feature_names.append(name)
         cols[name] = aligned
         per_feature_non_null[name] = non_null
+        feature_versions[name] = int(version)
 
     return _FeatureMatrixCache(
         cols=cols,
         feature_names=tuple(feature_names),
         per_feature_non_null=per_feature_non_null,
         bar_index=bar_index,
+        feature_versions=feature_versions,
     )
 
 
@@ -830,6 +846,7 @@ def _load_aux_interval_dataset(
         per_feature_pct_non_null=per_feature_pct,
         label_feature=spec.label_feature,
         label_version=spec.label_version,
+        feature_versions=dict(fmc.feature_versions),
     )
 
 
@@ -943,4 +960,8 @@ def load_stacked_dataset(
         per_feature_pct_non_null=per_feature_pct,
         label_feature=spec.label_feature,
         label_version=spec.label_version,
+        # Identical feature sets across pieces is asserted above; the
+        # serving piece's versions are the pinned set. interval_indicator
+        # is synthetic (not registry-backed) — absent by design.
+        feature_versions=dict(pieces[0][1].feature_versions),
     )
