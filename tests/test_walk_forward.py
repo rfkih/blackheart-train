@@ -423,19 +423,31 @@ def test_walk_forward_tracks_last_booster_from_most_recent_valid_fold():
 
 
 def test_train_via_walk_forward_returns_payload_with_last_fold_booster():
-    """The WF1 fix: the saved booster is the last fold's, and the
-    payload's ``metrics`` describe THAT booster (not the 80/20 fit)."""
+    """Honest-headline fix (project_ml_training_pipeline_forensics): the
+    registry ``metrics`` now carry the cross-fold AGGREGATE, while the
+    last-fold metrics that describe the SAVED booster live under
+    ``last_fold_metrics``. ``eval_kind`` reflects the aggregate."""
     ds = _make_dense_dataset(label_kind="binary", seed=42)
     spec = get_spec("regime_btc_v1")
     payload = train_via_walk_forward(ds, spec)
-    assert payload["eval_kind"] == "walk_forward_last_fold"
+    assert payload["eval_kind"] == "walk_forward_aggregate"
     assert payload["walk_forward"] is not None
-    # metrics must equal the last valid fold's metrics, by construction.
+    # last_fold_metrics must equal the last valid fold's metrics (the saved
+    # booster), by construction.
     last_valid = [
         fm for fm in payload["walk_forward"]["folds"]
         if fm["skipped_reason"] is None
     ][-1]
-    assert payload["metrics"] == last_valid["metrics"]
+    assert payload["last_fold_metrics"] == last_valid["metrics"]
+    # The HEADLINE metrics are the honest aggregate, NOT the single last
+    # fold: primary_mean/median/std are present and the primary metric equals
+    # the cross-fold mean (which generally differs from the last fold).
+    wf = payload["walk_forward"]
+    assert payload["metrics"]["primary_mean"] == wf["primary_mean"]
+    assert payload["metrics"]["primary_median"] == wf["primary_median"]
+    assert payload["metrics"][wf["primary_metric"]] == pytest.approx(
+        wf["metric_means"][wf["primary_metric"]]
+    )
     # The booster in the payload must match the result's last_booster.
     # (We can't trivially compare boosters; rely on the fact that
     # build_payload uses booster.model_to_string() for the content_sha.)

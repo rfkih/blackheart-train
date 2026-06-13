@@ -1,21 +1,30 @@
-"""Lighter 5-gate gauntlet for HYBRID sub-models (M5d).
+"""Lighter 6-gate gauntlet for HYBRID sub-models (M5d).
 
 Sub-models (regime / positioning / flow) modulate existing strategies;
 they are not standalone trading systems. The blueprint's full 13-gate
 gauntlet (capacity, cost stress, regime sub-cuts, retraining stability,
 shadow validation, etc.) targets standalone strategies that must clear
 a 10%/yr bar on their own. For sub-models we use a tighter set focused
-on **edge + stability**:
+on **edge + stability + transferability**:
 
   1. ``integrity_passed``         — training data wasn't degenerate
   2. ``walk_forward_complete``    — every configured fold produced a valid metric
-  3. ``generalization_edge``      — walk-forward primary mean ≥ threshold
+  3. ``generalization_edge``      — walk-forward primary mean AND median ≥ threshold
   4. ``fold_stability``           — walk-forward primary std ≤ threshold
   5. ``saved_booster_above_random``— the actual saved model isn't worse than random
+  6. ``transferability``          — conditional-invariance ci_max_abs_diff < threshold
+                                     (P(y|features) doesn't shift across folds)
 
-All five are pure functions of an artifact payload — no DB queries, no
+All six are pure functions of an artifact payload — no DB queries, no
 extra fits. Reviewer approval (Gate 8 in the full 13) is M5e's concern
 and is not auto-computable.
+
+Gates 3 (median) and 6 (transferability) were added 2026-06-13 after a
+coin-flip ETH regime model passed the original 5 gates and reached a live
+trading gate: its honest 6-fold mean AUC was 0.5338 (median 0.5109) yet a
+single lucky fold reported 0.6094, and its ci_max_abs_diff was 0.2949 (≥
+the 0.15 binary bar) — a conditional shift the old gate set never checked.
+See ``project_ml_training_pipeline_forensics``.
 
 Thresholds were calibrated by inspection of the M5b/M5c real results:
 HYBRID modulators only need a small consistent edge to add value on top
@@ -187,14 +196,30 @@ def _gate_generalization_edge(payload: dict[str, Any]) -> GateResult:
             threshold={"min_mean": threshold},
             rationale=f"walk-forward primary_mean is {mean!r}",
         )
-    verdict = "PASS" if mean >= threshold else "FAIL"
+    # A single lucky fold can lift the MEAN above the bar while the typical
+    # (MEDIAN) fold sits at random — that is how a coin-flip model (mean
+    # 0.5338, median 0.5109) cleared a 0.52 mean-only bar. Require the median
+    # to clear the threshold too, so fold-luck can't carry a no-signal model
+    # (project_ml_training_pipeline_forensics). Back-compat: only enforce the
+    # median when it is present in the payload.
+    median = wf.get("primary_median")
+    mean_ok = mean >= threshold
+    median_present = isinstance(median, (int, float)) and not math.isnan(median)
+    median_ok = (median is None) or (median_present and median >= threshold)
+    verdict = "PASS" if (mean_ok and median_ok) else "FAIL"
     return GateResult(
         name="generalization_edge", verdict=verdict,
-        actual={"metric": metric_name, "mean": round(float(mean), 4)},
-        threshold={"min_mean": threshold},
+        actual={
+            "metric": metric_name,
+            "mean": round(float(mean), 4),
+            "median": round(float(median), 4) if median_present else median,
+        },
+        threshold={"min_mean": threshold, "min_median": threshold},
         rationale=(
             f"walk-forward {metric_name} mean={mean:.4f} "
-            f"({'≥' if verdict == 'PASS' else '<'} threshold {threshold})"
+            f"({'≥' if mean_ok else '<'} {threshold}), median="
+            f"{round(float(median), 4) if median_present else median} "
+            f"({'≥' if median_ok else '<'} {threshold})"
         ),
     )
 
@@ -242,8 +267,13 @@ def _gate_saved_booster_above_random(payload: dict[str, Any]) -> GateResult:
     metric. For ``eval_kind='holdout_80_20'`` it's the 80/20 split's
     metric. Either way the metric describes the saved booster, by the
     M5c contract.
+
+    Reads ``last_fold_metrics`` when present (set by the honest-headline
+    fix so the registry ``metrics`` can carry the cross-fold AGGREGATE
+    while this gate still audits the SAVED booster), falling back to
+    ``metrics`` for holdout-trained / legacy payloads.
     """
-    metrics = payload.get("metrics") or {}
+    metrics = payload.get("last_fold_metrics") or payload.get("metrics") or {}
     wf = payload.get("walk_forward")
     metric_name = (wf or {}).get("primary_metric")
     # If walk-forward isn't present, infer the primary metric from
@@ -285,6 +315,78 @@ def _gate_saved_booster_above_random(payload: dict[str, Any]) -> GateResult:
     )
 
 
+def _gate_transferability(payload: dict[str, Any]) -> GateResult:
+    """Gate 6 — conditional-invariance transferability.
+
+    The missing gate that let a coin-flip ETH regime model PASS: the
+    walk-forward folds' worst per-(feature, bin) shift in ``P(y|features)``
+    between train and test (``ci_max_abs_diff``, averaged across folds) must
+    clear the objective-specific threshold in
+    ``conditional_invariance.PASS_THRESHOLD``. A model whose conditional
+    relationship shifts across folds (regime change) has untrustworthy OOS
+    metrics no matter how good the edge/stability numbers look.
+
+    Mirrors the 13-gate directional gauntlet's gate 4. ``adversarial_auc``
+    (``P(features)`` shift) is structurally ≈1.0 for hourly + macro bars on
+    rolling walk-forward (``project_v2_adversarial_auc``, 2026-05-16), so it
+    is surfaced INFO-ONLY and deliberately NOT gated — gating it would block
+    essentially every hourly model. ``ci_max_abs_diff`` is the right signal.
+    """
+    from .conditional_invariance import PASS_THRESHOLD
+
+    wf = payload.get("walk_forward")
+    if not wf:
+        return GateResult(
+            name="transferability", verdict="FAIL",
+            rationale="no walk_forward block; gate cannot be computed",
+        )
+    means = wf.get("metric_means") or {}
+    ci_max = means.get("ci_max_abs_diff")
+    adv = means.get("adversarial_auc")  # info-only; reported but NOT gated
+    spec_block = payload.get("spec") or {}
+    objective = spec_block.get("objective")
+    threshold = PASS_THRESHOLD.get(objective) if objective else None
+
+    def _round(v: Any) -> Any:
+        return round(float(v), 4) if isinstance(v, (int, float)) and not math.isnan(v) else v
+
+    if threshold is None:
+        return GateResult(
+            name="transferability", verdict="FAIL",
+            actual={"objective": objective, "ci_max_abs_diff": ci_max,
+                    "adversarial_auc": _round(adv)},
+            rationale=(
+                f"no PASS_THRESHOLD configured for objective={objective!r}; "
+                f"add it to conditional_invariance.PASS_THRESHOLD"
+            ),
+        )
+    if ci_max is None or (isinstance(ci_max, float) and math.isnan(ci_max)):
+        return GateResult(
+            name="transferability", verdict="FAIL",
+            actual={"ci_max_abs_diff": ci_max, "adversarial_auc": _round(adv)},
+            threshold={"max_ci_max_abs_diff": threshold, "objective": objective},
+            rationale=(
+                "ci_max_abs_diff missing or not finite — re-train so walk-forward "
+                "computes conditional invariance; transferability cannot be affirmed"
+            ),
+        )
+    verdict = "PASS" if ci_max < threshold else "FAIL"
+    return GateResult(
+        name="transferability", verdict=verdict,
+        actual={
+            "ci_max_abs_diff": round(float(ci_max), 4),
+            "ci_mean_abs_diff": _round(means.get("ci_mean_abs_diff")),
+            "adversarial_auc": _round(adv),
+        },
+        threshold={"max_ci_max_abs_diff": threshold, "objective": objective},
+        rationale=(
+            f"ci_max_abs_diff={ci_max:.4f} "
+            f"({'<' if verdict == 'PASS' else '≥'} {threshold} for {objective}); "
+            f"adversarial_auc={_round(adv)} (info-only)"
+        ),
+    )
+
+
 # ── Aggregator ────────────────────────────────────────────────────────────
 
 
@@ -294,11 +396,12 @@ _GATES = (
     _gate_generalization_edge,
     _gate_fold_stability,
     _gate_saved_booster_above_random,
+    _gate_transferability,
 )
 
 
 def run_gauntlet(payload: dict[str, Any]) -> GauntletReport:
-    """Run all 5 gates on the artifact payload. Overall verdict is PASS
+    """Run all 6 gates on the artifact payload. Overall verdict is PASS
     only if every gate is PASS — SKIP gates count as failing the
     overall AND because we cannot affirm a SKIP'd dimension. The
     operator can re-run with the missing inputs (e.g. ``--walk-forward``)

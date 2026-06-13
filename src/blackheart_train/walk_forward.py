@@ -793,9 +793,10 @@ def train_via_walk_forward(
 
     last_fold = valid_folds[-1]
     logger.info(
-        "trained via walk-forward | spec=%s eval_kind=walk_forward_last_fold "
-        "last_fold_metrics=%s",
-        spec.name, last_fold.metrics,
+        "trained via walk-forward | spec=%s last_fold_metrics=%s "
+        "aggregate_mean_%s=%.4f median=%.4f",
+        spec.name, last_fold.metrics, result.primary_metric,
+        result.primary_mean, result.primary_median,
     )
 
     payload = build_payload(
@@ -808,4 +809,22 @@ def train_via_walk_forward(
         eval_kind="walk_forward_last_fold",
     )
     payload["walk_forward"] = walk_forward_to_dict(result)
+
+    # ── Honest-headline fix (project_ml_training_pipeline_forensics) ─────────
+    # The single last fold is the best-looking of N noisy folds; reporting it
+    # as the registry headline made a coin-flip model look decent (auc 0.6094
+    # vs honest 6-fold mean 0.5338) and misled a live-gate decision. Make the
+    # REGISTRY headline the cross-fold AGGREGATE, and preserve the last-fold
+    # metrics — which describe the actual SAVED booster — under a distinct key
+    # so the gauntlet's saved_booster gate still audits the shipped model.
+    # SAFE: content_sha256 is computed in build_payload from model-identity
+    # fields only (spec/features/booster string), NOT metrics, so this
+    # reassignment does not change the artifact's identity.
+    payload["last_fold_metrics"] = dict(last_fold.metrics)
+    headline: dict[str, Any] = dict(result.metric_means)
+    headline["primary_mean"] = result.primary_mean
+    headline["primary_median"] = result.primary_median
+    headline["primary_std"] = result.primary_std
+    payload["metrics"] = headline
+    payload["eval_kind"] = "walk_forward_aggregate"
     return payload
